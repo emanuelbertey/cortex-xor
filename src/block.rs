@@ -221,8 +221,6 @@ mod tests {
         let m_state = MLstmstate::new(
              Tensor::zeros((1, 4, 16, 16), DType::F32, &device)?,
              Tensor::zeros((1, 10), DType::F32, &device)?,
-             Tensor::zeros((1, 4, 16), DType::F32, &device)?,
-             Tensor::zeros((1, 4, 1), DType::F32, &device)?,
         );
         let lstm_state_m = LSTMState::MLSTM(vec![m_state]);
         let detached_m = lstm_state_m.detach();

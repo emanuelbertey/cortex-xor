@@ -21,7 +21,11 @@ use tokenizers::tokenizer::Tokenizer as HFTokenizer;
 use tokenizers::models::TrainerWrapper;
 use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
 
-use xlstm::{LstmType, XLstm, XLstmconfig, BlockType};
+use xlstm::{LstmType, XLstm, XLstmconfig, LSTMState};
+// #[path = "mlstm.rs"]
+// mod mlstm;
+// use mlstm::{MLstm, MLstmconfig, MLstmstate};
+use candle_nn::{linear, Linear, Module};
 use rand::Rng;
 
 /// Tokenizador profesional usando la librería 'tokenizers' de Hugging Face
@@ -242,6 +246,7 @@ fn sample_from_logits(logits: &Tensor, temperature: f32) -> Result<usize> {
 
 
 /// Genera texto de forma recurrente manteniendo el estado interno del modelo
+/// Genera texto de forma recurrente manteniendo el estado interno del modelo
 fn generate_text(
     model: &XLstm,
     tokenizer: &Tokenizer,
@@ -267,35 +272,27 @@ fn generate_text(
         };
 
         let seq_len = tokens_to_process.len();
-        
-        // Ensure u32 for indices
         let indices_vec: Vec<u32> = tokens_to_process.iter().map(|&t| t as u32).collect();
-        // Input: [1, seq_len] indices
         let input = Tensor::from_vec(
             indices_vec, 
             (1, seq_len), 
             device
         )?;
 
+        // XLstm Forward (Embed + Blocks + Head)
         let (output, next_state) = model.forward(&input, current_state)?;
-        current_state = Some(next_state.into_iter().map(|s| s.map(|state| state.detach())).collect());
-        //current_state = Some(next_state);
+        current_state = Some(next_state.into_iter().map(|s| s.map(|st| st.detach())).collect());
 
-        let (_b, _l, _v) = output.dims3()?;
         // Extract last step logits
-       
         let last_logits = output.narrow(1, seq_len - 1, 1)?
-        .squeeze(1)?
-        .detach();
-        //let last_logits = output.narrow(1, seq_len - 1, 1)?
-           // .squeeze(1)?; // [1, vocab_size]
+            .squeeze(1)?
+            .detach();
 
         let next_token = sample_from_logits(&last_logits, 0.7)?;
 
         current_tokens.push(next_token);
         if let Some(t) = tokenizer.id_to_token(next_token) {
             let mut clean_token = t.clone();
-            // Reemplazo de caracteres especiales de BPE si es necesario
             if clean_token.contains('Ċ') || clean_token.contains('Ġ') {
                clean_token = clean_token.replace("Ċ", "\n").replace("Ġ", " ");
             }
@@ -371,11 +368,11 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
     let output_size = vocab_size; 
     let mut dropout = 0.00;
 
-    let seq_length = 64; 
+    let seq_length = 128; 
     let batch_size = 16; 
-    let stride = 64;     
+    let stride = 128;     
     let num_epochs = 50;
-    let num_heads = 8;
+    let num_heads = 4;
 
     println!("Configuración del modelo:");
     println!("  Bloques: {}", num_blocks);
@@ -386,12 +383,13 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
 
     let device = Device::Cpu;
 
-     let config = XLstmconfig::new(hidden_size, hidden_size, num_layers, num_blocks, output_size)
+    // Configuración XLstm (Reemplaza MLstm)
+    let config = XLstmconfig::new(hidden_size, hidden_size, num_layers, num_blocks, output_size)
         .with_vocab_size(vocab_size)
         .with_dropout(dropout)
         .with_num_heads(num_heads)
-        .with_lstm_type(LstmType::MLSTM)
-        .with_use_projection(true);   
+        .with_lstm_type(LstmType::MLSTM) 
+        .with_use_projection(true);
 
     let model_file_path = Path::new(model_path);
     let existe_modelo = model_file_path.exists();
@@ -404,14 +402,16 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
         io::stdin().read_line(&mut input)?;
         if input.trim().to_lowercase() == "s" {
             continuar_entrenamiento = true;
-         }/* else {
-            continuar_entrenamiento = false;
-         }*/
+         }
     }
 
     let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let mut model = config.init(vb)?;
+    
+    // START MODEL INIT
+    // El modelo XLstm ahora contiene internamente el embedding y el head (projection)
+    let mut model = config.init(vb.pp("model"))?;
+    // END MODEL INIT
 
     if existe_modelo {
          if !continuar_entrenamiento {
@@ -426,13 +426,12 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
          println!("No se encontró modelo guardado. Iniciando entrenamiento desde cero...\n");
     }
     
-    // Logic from main.rs training loop, adapted
     if !existe_modelo || continuar_entrenamiento {
 
         if !tokens.is_empty() {
              let first_token_idx = tokens[0];
              let first_token_str = tokenizer.id_to_token(first_token_idx).unwrap_or("?".to_string());
-             println!("--- INSPECCIÓN DE EMBEDDING ---");
+             println!("--- INSPECCIÓN DE TOKENS ---");
              println!("  Token Index: {}", first_token_idx);
              println!("  Token Str: '{}'", first_token_str);
              println!("-----------------------------\n");
@@ -441,77 +440,43 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
         let num_sequences = tokens.len().saturating_sub(seq_length);
         let num_actual_sequences = (num_sequences + stride - 1) / stride;
 
-        // Group parameters for optimizers (as in main.rs)
-        let parsed_block_types = match config.lstm_type {
-            LstmType::SLSTM => vec![BlockType::SLSTM; num_blocks],
-            LstmType::MLSTM => vec![BlockType::MLSTM; num_blocks],
-            LstmType::Alternate => (0..num_blocks)
-                .map(|i| if i % 2 == 0 { BlockType::SLSTM } else { BlockType::MLSTM })
-                .collect(),
-            LstmType::Custom(ref types) => types.clone(),
-        };
-
-        let mut slstm_params = Vec::new();
-        let mut mlstm_params = Vec::new();
-        let mut other_params = Vec::new();
-
+        // Collect parameters
+        let mut all_params = Vec::new();
         let data = varmap.data().lock().unwrap();
-        for (name, var) in data.iter() {
-            if name.starts_with("block_") {
-                let parts: Vec<&str> = name.split('.').collect();
-                if let Some(block_part) = parts.first() {
-                    if let Some(idx_str) = block_part.strip_prefix("block_") {
-                         if let Ok(idx) = idx_str.parse::<usize>() {
-                             if idx < parsed_block_types.len() {
-                                 match parsed_block_types[idx] {
-                                     BlockType::SLSTM => slstm_params.push(var.clone()),
-                                     BlockType::MLSTM => mlstm_params.push(var.clone()),
-                                 }
-                             } else { other_params.push(var.clone()); }
-                         } else { other_params.push(var.clone()); }
-                    } else { other_params.push(var.clone()); }
-                } else { other_params.push(var.clone()); }
-            } else { other_params.push(var.clone()); }
+        for (_name, var) in data.iter() {
+            all_params.push(var.clone());
         }
-        drop(data); // release lock before training
+        drop(data);
 
-        // Tasas de aprendizaje recomendadas para xLSTM: 
-        // sLSTM suele tolerar LRs más altas, mLSTM requiere más cuidado.
-        let mut optim_slstm = AdamW::new(slstm_params, ParamsAdamW { lr: 2e-4, ..Default::default() })?;
-      //  let mut optim_mlstm = AdamW::new(mlstm_params, ParamsAdamW { lr: 8e-4, ..Default::default() })?;
-        let mut optim_other = AdamW::new(other_params, ParamsAdamW { lr: 2e-4, ..Default::default() })?;
-
-
-        model.print_architecture();
-
-
-        let lr_max = 8.5e-6;
-        let lr_min = 7.9e-6;//2.71e-4
-        let mut aumentando = false; // Control de dirección
-        let step_factor = 0.985;      // Qué tan rápido cambia
-        let mut current_lr = 8e-6;
-        let mut optim_mlstm = AdamW::new(mlstm_params.clone(), ParamsAdamW { 
+        // Ajuste de Learning Rate para xLSTM
+        let current_lr = 3e-3; // Un poco más conservador para empezar
+        
+        let mut optimizer = AdamW::new(all_params, ParamsAdamW { 
             lr: current_lr, 
             ..Default::default() 
         })?;
 
-        println!("Iniciando entrenamiento...\n");
+        println!("Iniciando entrenamiento (XLstm - {:?})...\n", config.lstm_type);
 
         let num_batches = num_actual_sequences.div_ceil(batch_size);
-        dropout = 0.1;
+        dropout = 0.0; 
+        // Actualizamos dropout en el modelo si es necesario, 
+        // aunque XLstm lo configura en init. Si XLstm struct lo expone pub, podemos:
+        model.dropout = dropout;
+
         for epoch in 0..num_epochs {
             let mut total_loss = 0.0f32;
             let mut num_losses = 0;
             let mut correct = 0;
             let mut total = 0;
-            //let mut current_state = None;
+            
             for batch_idx in 0..num_batches {
                 let epoch_start = Instant::now();
                 let current_batch_start_seq = batch_idx * batch_size;
                 let current_batch_size = (batch_size).min(num_actual_sequences - current_batch_start_seq);
 
                 if current_batch_size == 0 { break; }
-                if current_batch_size < batch_size { break; } // Skip incomplete
+                if current_batch_size < batch_size { break; } 
 
                 let (input_batch, target_batch) = create_batch(
                     &tokens,
@@ -521,26 +486,13 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
                     stride,
                     &device,
                 )?;
-/*
-                if batch_idx == 0 {
-                // Hacemos un forward silencioso para llenar las matrices del mLSTM
-                let (_, warm_state) = model.forward(&input_batch, None)?;
-                current_state = Some(warm_state.into_iter().map(|s| s.map(|state| state.detach())).collect());
-                println!("> Estado inicializado con éxito en el Batch 0");
-              }*/
                
-             
-              let (logits, _) = model.forward(&input_batch,  None)?;
-             /* let (logits, next_state) = model.forward(&input_batch, current_state)?;
-               current_state = Some(next_state.into_iter().map(|s| s.map(|state| state.detach())).collect());
-*/
+                // Forward: XLstm maneja embedding internamente si se configuró vocab_size
+                let (logits, _) = model.forward(&input_batch, None)?;
 
-                // Optimization
+                // Loss
                 let logits_flat = logits.reshape((current_batch_size * seq_length, vocab_size))?;
-                let target_flat = target_batch.reshape((current_batch_size * seq_length,))?; // IDs [N]
-
-                // Cross Entropy
-                // Candle cross_entropy expects logits and targets (u32 indices)
+                let target_flat = target_batch.reshape((current_batch_size * seq_length,))?;
                 let loss = candle_nn::loss::cross_entropy(&logits_flat, &target_flat)?;
                 
                 total_loss += loss.to_scalar::<f32>()?;
@@ -553,16 +505,7 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
                 total += current_batch_size * seq_length;
 
                 let grads = loss.backward()?;
-
-                /* 
-                // --- GRADIENT CLIPPING (Sugerido para prevenir estancamiento) ---
-                // Para xLSTM es vital clipear gradientes debido a las funciones exponenciales
-                */
-
-                // Ahora los optimizadores usarán los gradientes clipeados
-                optim_slstm.step(&grads)?;
-                optim_mlstm.step(&grads)?;
-                optim_other.step(&grads)?;
+                optimizer.step(&grads)?;
 
                 if batch_idx % 1 == 0 || batch_idx == num_batches - 1 {
                     let elapsed = epoch_start.elapsed().as_secs_f32();
@@ -570,55 +513,21 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
                         batch_idx + 1, num_batches, total_loss / (num_losses as f32),
                         100.0 * correct as f32 / total as f32, elapsed);
                     io::stdout().flush().unwrap();
-                
                 }
 
-
-               if batch_idx % 15 == 0 && batch_idx > 0 {
-                    let factor = step_factor as f32; //  errores
-
-                    if aumentando {
-
-                        dropout /= factor;           // 1. Actualizamos la variable local
-                        model.dropout = dropout;     // 2. Se la pasamos al model
-                        current_lr /= step_factor; // El LR suele ser f64, está bien
-                        if current_lr >= lr_max {
-                            current_lr = lr_max;
-                            aumentando = false; 
-                        }
-                    } else {
-                            dropout *= factor;           // 1. Actualizamos la variable local 
-                        current_lr *= step_factor; 
-                        if current_lr <= lr_min {
-                            current_lr = lr_min;
-                            aumentando = true; 
-                        }
-                    }
-                    dropout = dropout.clamp(0.05, 0.20);
-                    model.blocks.iter_mut().for_each(|b| b.dropout_prob = dropout);
-            
-                    println!(
-                        "\n[CYCLIC SCHEDULER] LR: {:.2e} | Dropout: {:.4} | Dirección: {}", 
-                        current_lr, 
-                       dropout, //
-                        if aumentando { "Sube ↑" } else { "Baja ↓" }
-                    );
-                } 
-
-        optim_mlstm = AdamW::new(mlstm_params.clone(),ParamsAdamW {lr: current_lr,..Default::default() }  )?;
-                                        
+               if batch_idx % 20 == 0 && batch_idx > 0 {
+                   //  varmap.save(model_path)?;
+                // Simple scheduler placeholder
+               }
             }
             println!();
 
             let avg_loss = total_loss / num_losses as f32;
             let accuracy = 100.0 * correct as f32 / total as f32;
-
             println!("Epoch [{:3}/{}], Loss: {:.4}, Accuracy: {:.2}%", epoch + 1, num_epochs, avg_loss, accuracy);
 
-            // Save per epoch
             varmap.save(model_path)?;
 
-            // Generate sample
              if epoch % 1 == 0 {
                 let mut rng = rand::rng();
                 let start_random = if tokens.len() > 10 {
@@ -628,7 +537,9 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
                 let seed_tokens: Vec<usize> = tokens[start_random..start_random + 5].to_vec();
                 let seed = tokenizer.decode(&seed_tokens);
                 
+                
                 println!("  -> Generando con semilla al azar: '{}'", seed);
+                // Updated generate_text call
                 let generated = generate_text(&model, &tokenizer, &seed, 100, &device)?;
                 println!("  Generado: {}\n", generated);
             }
@@ -696,6 +607,7 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
         };
 
         println!("\nGenerando...");
+        // Updated generate_text call
         let generated = generate_text(&model, &tokenizer, &seed, gen_length, &device)?;
         println!("Generado: {}\n", generated);
     }
