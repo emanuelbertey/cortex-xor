@@ -26,6 +26,9 @@ cargo run --release --bin test_mlstm_param_sweep -- 0 200
 $env:RUST_BACKTRACE=1; cargo run --release --bin test_slstm_param_sweep -- 0 100
 cargo run --release --bin test_slstm_param_sweep -- 0 200
 
+$env:RUST_BACKTRACE=1; cargo run --release --bin test_mlstm_plus -- 200
+cargo run --release --bin test_mlstm_plus -- 500
+
 $env:RUST_BACKTRACE=1; cargo run --release --bin slstmchat -- input.txt
 
 $env:RUST_BACKTRACE=1; cargo run --release --bin testxlstm -- input.txt
@@ -50,3 +53,5 @@ $env:RUST_BACKTRACE=1; cargo run --release --bin tinystory -- dictionary.txt
 
 $env:RUST_BACKTRACE=1; cargo run --release --bin tinystory2v  -- dictionary.txt
 $env:RUST_BACKTRACE=1; cargo run --release --bin tinystory3v  -- H:\Windows.old\Users\emabertey\Downloads\dataset\TinyStoriesV2-GPT4-train.txt
+
+$env:RUST_BACKTRACE=1; cargo run --release --bin mlstm_minlstm_chat -- input.txt
