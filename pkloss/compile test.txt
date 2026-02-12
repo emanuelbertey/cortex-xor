@@ -1,0 +1,39 @@
+$env:RUSTFLAGS="-C target-cpu=native"
+
+cargo build --release --bin mainchat
+
+cargo run --release --bin mlstmchat -- input.txt
+
+$env:RUST_BACKTRACE=1; cargo run --release --bin mlstmchat -- input.txt
+
+$env:RUST_BACKTRACE=1; cargo run --release --bin xlstmchat -- input.txt
+ 
+ ParamsAdamW lr: 6e-3   slstmchat
+
+$env:RUST_BACKTRACE=1; cargo run --release --bin slstmchat -- input.txt
+
+$env:RUST_BACKTRACE=1; cargo run --release --bin testxlstm -- input.txt
+
+$env:RUST_BACKTRACE=1; cargo run --release --bin luong-slstm -- input.txt
+
+$env:RUST_BACKTRACE=1; cargo run --release --bin bug-luong -- input.txt
+
+
+$env:RUST_BACKTRACE=1; cargo run --release --bin 2slstmchat -- input.txt
+
+cargo run --release --bin xlstm_core_train -- input.txt
+
+$env:RUST_BACKTRACE=1; cargo run --release --bin mlstmnew -- input.txt
+
+cargo run --release --bin xlstm_core_train -- input.txt
+
+cargo run --release --bin mlstmchat -- input.txt
+
+$env:RUST_BACKTRACE=1; cargo run --release --bin cortexslstm -- input.txt
+
+$env:RUST_BACKTRACE=1; cargo run --release --bin cortexthread -- input.txt
+
+$env:RUST_BACKTRACE=1; cargo run --release --bin tinystory -- dictionary.txt
+
+$env:RUST_BACKTRACE=1; cargo run --release --bin tinystory2v  -- dictionary.txt
+$env:RUST_BACKTRACE=1; cargo run --release --bin tinystory3v  -- C:\Windows.old\Users\emabertey\Downloads\dataset\TinyStoriesV2-GPT4-train.txt
