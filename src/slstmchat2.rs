@@ -20,10 +20,10 @@ use tokenizers::models::bpe::{BpeTrainerBuilder, BPE};
 use tokenizers::tokenizer::Tokenizer as HFTokenizer;
 use tokenizers::models::TrainerWrapper;
 use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
-use tokenizers::AddedToken;
 
 use xlstm::{LstmType, XLstm, XLstmconfig, BlockType};
 use rand::Rng;
+use rand::seq::SliceRandom;
 
 /// Tokenizador profesional usando la librería 'tokenizers' de Hugging Face
 pub struct Tokenizer {
@@ -32,20 +32,6 @@ pub struct Tokenizer {
 
 impl Tokenizer {
     pub fn from_text(text: &str, vocab_size: usize) -> Result<Self> {
-        // 1. Definir los tokens especiales
-        let special_tokens_strings = vec![
-            "[ENG]".to_string(),
-            "[SEP]".to_string(),
-            "[ESP]".to_string(),
-            "[EOS]".to_string(),
-            "<PAD>".to_string(),
-        ];
-
-        let special_tokens: Vec<AddedToken> = special_tokens_strings
-            .iter()
-            .map(|t| AddedToken::from(t, true))
-            .collect();
-
         let model = BPE::builder()
             .byte_fallback(true)
             .build()
@@ -53,7 +39,6 @@ impl Tokenizer {
 
         let mut tokenizer = HFTokenizer::new(model);
 
-        // Configurar Metaspace (el carácter '_' visual para espacios)
         tokenizer.with_pre_tokenizer(Some(Metaspace::new(
             ' ',
             PrependScheme::Always,
@@ -64,28 +49,20 @@ impl Tokenizer {
         alphabet.insert('\n');
         alphabet.insert(' ');
 
-        // 2. Configurar el Trainer con los Special Tokens
         let trainer = BpeTrainerBuilder::default()
             .show_progress(true)
             .vocab_size(vocab_size)
-            .min_frequency(2) // Subimos a 2 para evitar tokens basura
+            .min_frequency(0)
             .initial_alphabet(alphabet)
-            .special_tokens(special_tokens.clone()) // <--- VITAL
             .build();
 
         let mut trainer_wrapper = TrainerWrapper::from(trainer);
 
-        // 3. Entrenar
         let temp_file = "temp_train.txt";
         fs::write(temp_file, text)?;
         tokenizer.train_from_files(&mut trainer_wrapper, vec![temp_file.to_string()])
             .map_err(|e| anyhow::anyhow!(e))?;
         fs::remove_file(temp_file)?;
-
-        // 4. Registrar los tokens en el tokenizador
-        for token in special_tokens_strings {
-            tokenizer.add_special_tokens(&[AddedToken::from(token, true)]);
-        }
 
         Ok(Self { tokenizer })
     }
@@ -342,8 +319,8 @@ fn main() -> Result<()> {
     }
 
     let text_file = &args[1];
-    let tokenizer_path = "2tlitte.json";
-    let model_path = "2lilitchat_model.safetensors";
+    let tokenizer_path = "tlitte.json";
+    let model_path = "minlst.safetensors";
 
     let target_vocab_size = 1024;
 
@@ -388,17 +365,17 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
     println!("Tokens totales: {}\n", tokens.len());
 
     let vocab_size = tokenizer.vocab_size();
-    let hidden_size = 320; 
+    let hidden_size = 256; 
     let num_layers = 1;
-    let num_blocks = 2;
+    let num_blocks = 1;
     let output_size = vocab_size; 
     let dropout = 0.0;
 
-    let seq_length = 64; 
-    let batch_size = 24; 
-    let stride = 64;     
+    let seq_length = 128; 
+    let batch_size = 16; 
+    let stride = 128;     
     let num_epochs = 50;
-    let num_heads = 2;
+    let num_heads = 4;
 
     println!("Configuración del modelo:");
     println!("  Bloques: {}", num_blocks);
@@ -413,7 +390,7 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
         .with_vocab_size(vocab_size)
         .with_dropout(dropout)
         .with_num_heads(num_heads)
-        .with_lstm_type(LstmType::SLSTM) 
+        .with_lstm_type(LstmType::MinLSTM) 
         .with_use_projection(true);   
 
     let model_file_path = Path::new(model_path);
@@ -466,20 +443,50 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
         let parsed_block_types = match config.lstm_type {
             LstmType::SLSTM => vec![BlockType::SLSTM; num_blocks],
             LstmType::MLSTM => vec![BlockType::MLSTM; num_blocks],
+            LstmType::MinGRU => vec![BlockType::MinGRU; num_blocks],
+            LstmType::MinLSTM => vec![BlockType::MinLSTM; num_blocks],
             LstmType::Alternate => (0..num_blocks)
                 .map(|i| if i % 2 == 0 { BlockType::SLSTM } else { BlockType::MLSTM })
                 .collect(),
             LstmType::Custom(ref types) => types.clone(),
         };
 
-        let mut params = Vec::new();
+        let mut slstm_params = Vec::new();
+        let mut mlstm_params = Vec::new();
+        let mut mingru_params = Vec::new();
+        let mut minlstm_params = Vec::new();
+        let mut other_params = Vec::new();
+
         let data = varmap.data().lock().unwrap();
-        for (_, var) in data.iter() {
-            params.push(var.clone());
+        for (name, var) in data.iter() {
+            if name.starts_with("block_") {
+                let parts: Vec<&str> = name.split('.').collect();
+                if let Some(block_part) = parts.first() {
+                    if let Some(idx_str) = block_part.strip_prefix("block_") {
+                         if let Ok(idx) = idx_str.parse::<usize>() {
+                             if idx < parsed_block_types.len() {
+                                 match parsed_block_types[idx] {
+                                     BlockType::SLSTM => slstm_params.push(var.clone()),
+                                     BlockType::MLSTM => mlstm_params.push(var.clone()),
+                                     BlockType::MinGRU => mingru_params.push(var.clone()),
+                                     BlockType::MinLSTM => minlstm_params.push(var.clone()),
+                                 }
+                             } else { other_params.push(var.clone()); }
+                         } else { other_params.push(var.clone()); }
+                    } else { other_params.push(var.clone()); }
+                } else { other_params.push(var.clone()); }
+            } else { other_params.push(var.clone()); }
         }
         drop(data); // release lock before training
 
-        let mut optimizer = AdamW::new(params, ParamsAdamW { lr: 1e-4, ..Default::default() })?;
+        // Tasas de aprendizaje recomendadas para xLSTM: 
+        // sLSTM suele tolerar LRs más altas, mLSTM requiere más cuidado.
+        // MinGRU y MinLSTM necesitan LRs extremadamente bajos por estabilidad numérica
+        let mut optim_slstm = AdamW::new(slstm_params, ParamsAdamW { lr: 8e-3, ..Default::default() })?;
+        let mut optim_mlstm = AdamW::new(mlstm_params, ParamsAdamW { lr: 8e-5, ..Default::default() })?;
+        let mut optim_mingru = AdamW::new(mingru_params, ParamsAdamW { lr: 1e-4, ..Default::default() })?;
+        let mut optim_minlstm = AdamW::new(minlstm_params, ParamsAdamW { lr: 1e-3, ..Default::default() })?;
+        let mut optim_other = AdamW::new(other_params, ParamsAdamW { lr: 2e-4, ..Default::default() })?;
 
         println!("Iniciando entrenamiento...\n");
         model.print_architecture();
@@ -491,13 +498,19 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
             let mut correct = 0;
             let mut total = 0;
            // let mut current_state = None;
-            for batch_idx in 0..num_batches {
+            let mut batch_order: Vec<usize> = (0..num_batches).collect();
+            {
+                let mut rng = rand::rng();
+                batch_order.shuffle(&mut rng);
+            }
+
+            for (batch_pos, batch_idx) in batch_order.into_iter().enumerate() {
                 let epoch_start = Instant::now();
                 let current_batch_start_seq = batch_idx * batch_size;
                 let current_batch_size = (batch_size).min(num_actual_sequences - current_batch_start_seq);
 
-                if current_batch_size == 0 { break; }
-                if current_batch_size < batch_size { break; } // Skip incomplete
+                if current_batch_size == 0 { continue; }
+                if current_batch_size < batch_size { continue; } // Skip incomplete
 
                 let (input_batch, target_batch) = create_batch(
                     &tokens,
@@ -528,8 +541,9 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
                 // Cross Entropy
                 // Candle cross_entropy expects logits and targets (u32 indices)
                 let loss = candle_nn::loss::cross_entropy(&logits_flat, &target_flat)?;
-                
-                total_loss += loss.to_scalar::<f32>()?;
+                let batch_loss = loss.to_scalar::<f32>()?;
+
+                total_loss += batch_loss;
                 num_losses += 1;
 
                 // Accuracy
@@ -541,17 +555,23 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
                 let grads = loss.backward()?;
 
                 /* 
-                // --- GRADIENT CLIPPING (Sugerido para prevenir estancamiento) ---
+                // --- GRADIENT CLIPPING (Desactivado temporalmente) ---
                 // Para xLSTM es vital clipear gradientes debido a las funciones exponenciales
+                // Nota: La API de GradStore en Candle no tiene los métodos esperados
+                // Por ahora nos basamos en LR bajo y clamping para estabilidad
                 */
 
-                // Ahora los optimizadores usarán los gradientes clipeados
-                optimizer.step(&grads)?;
+                // Ahora los optimizadores usarán los gradientes
+                optim_slstm.step(&grads)?;
+                optim_mlstm.step(&grads)?;
+                optim_mingru.step(&grads)?;
+                optim_minlstm.step(&grads)?;
+                optim_other.step(&grads)?;
 
-                if batch_idx % 1 == 0 || batch_idx == num_batches - 1 {
+                if batch_pos % 1 == 0 || batch_pos == num_batches - 1 {
                     let elapsed = epoch_start.elapsed().as_secs_f32();
-                    print!("\r  -> Batch [{}/{}] Loss: {:.4} Acc: {:.2}% ({:.1}s)", 
-                        batch_idx + 1, num_batches, total_loss / (num_losses as f32),
+                    print!("\r  -> Batch [{}/{}] Loss: {:.4} (avg {:.4}) Acc: {:.2}% ({:.1}s)", 
+                        batch_pos + 1, num_batches, batch_loss, total_loss / (num_losses as f32),
                         100.0 * correct as f32 / total as f32, elapsed);
                     io::stdout().flush().unwrap();
                

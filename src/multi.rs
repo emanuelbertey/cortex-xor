@@ -290,7 +290,7 @@ fn generate_text(
         //let last_logits = output.narrow(1, seq_len - 1, 1)?
            // .squeeze(1)?; // [1, vocab_size]
 
-        let next_token = sample_from_logits(&last_logits, 0.7)?;
+        let next_token = sample_from_logits(&last_logits, 0.8)?;
 
         current_tokens.push(next_token);
         if let Some(t) = tokenizer.id_to_token(next_token) {
@@ -319,8 +319,8 @@ fn main() -> Result<()> {
     }
 
     let text_file = &args[1];
-    let tokenizer_path = "newmlstm.json";
-    let model_path = "newmlstm.safetensors";
+    let tokenizer_path = "tokenizer_mlstm.json";
+    let model_path = "xlstm_chat_model_mlstm.safetensors";
 
     let target_vocab_size = 1024;
 
@@ -365,11 +365,11 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
     println!("Tokens totales: {}\n", tokens.len());
 
     let vocab_size = tokenizer.vocab_size();
-    let hidden_size = 512; 
+    let hidden_size = 256; 
     let num_layers = 1;
-    let num_blocks = 1;
+    let num_blocks = 2;
     let output_size = vocab_size; 
-    let mut dropout = 0.00;
+    let  mut dropout = 0.0;
 
     let seq_length = 128; 
     let batch_size = 16; 
@@ -390,7 +390,7 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
         .with_vocab_size(vocab_size)
         .with_dropout(dropout)
         .with_num_heads(num_heads)
-        .with_lstm_type(LstmType::MLSTM)
+        .with_lstm_type(LstmType::SLSTM)
         .with_use_projection(true);   
 
     let model_file_path = Path::new(model_path);
@@ -411,6 +411,7 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
 
     let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+    //let model = config.init(vb)?;
     let mut model = config.init(vb)?;
 
     if existe_modelo {
@@ -445,8 +446,6 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
         let parsed_block_types = match config.lstm_type {
             LstmType::SLSTM => vec![BlockType::SLSTM; num_blocks],
             LstmType::MLSTM => vec![BlockType::MLSTM; num_blocks],
-            LstmType::MinGRU => vec![BlockType::MinGRU; num_blocks],
-            LstmType::MinLSTM => vec![BlockType::MinLSTM; num_blocks],
             LstmType::Alternate => (0..num_blocks)
                 .map(|i| if i % 2 == 0 { BlockType::SLSTM } else { BlockType::MLSTM })
                 .collect(),
@@ -468,7 +467,6 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
                                  match parsed_block_types[idx] {
                                      BlockType::SLSTM => slstm_params.push(var.clone()),
                                      BlockType::MLSTM => mlstm_params.push(var.clone()),
-                                     BlockType::MinGRU | BlockType::MinLSTM => other_params.push(var.clone()),
                                  }
                              } else { other_params.push(var.clone()); }
                          } else { other_params.push(var.clone()); }
@@ -481,15 +479,16 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
         // Tasas de aprendizaje recomendadas para xLSTM: 
         // sLSTM suele tolerar LRs más altas, mLSTM requiere más cuidado.
         let mut optim_slstm = AdamW::new(slstm_params, ParamsAdamW { lr: 2e-4, ..Default::default() })?;
-      //  let mut optim_mlstm = AdamW::new(mlstm_params, ParamsAdamW { lr: 8e-4, ..Default::default() })?;
+       // let mut optim_mlstm = AdamW::new(mlstm_params, ParamsAdamW { lr: 8e-4, ..Default::default() })?;
         let mut optim_other = AdamW::new(other_params, ParamsAdamW { lr: 2e-4, ..Default::default() })?;
 
-model.print_architecture();
-        let lr_max = 1e-4;
-        let lr_min = 8e-4;
+
+        model.print_architecture();
+        let lr_max = 4e-4;
+        let lr_min = 2.5e-4;
         let mut aumentando = false; // Control de dirección
         let step_factor = 0.985;      // Qué tan rápido cambia
-        let mut current_lr = 9e-4;
+        let mut current_lr = 6.5e-4;
         let mut optim_mlstm = AdamW::new(mlstm_params.clone(), ParamsAdamW { 
             lr: current_lr, 
             ..Default::default() 
@@ -499,7 +498,7 @@ model.print_architecture();
         println!("Iniciando entrenamiento...\n");
 
         let num_batches = num_actual_sequences.div_ceil(batch_size);
-        dropout = 0.0;
+        dropout = 0.008;
         for epoch in 0..num_epochs {
             let mut total_loss = 0.0f32;
             let mut num_losses = 0;
@@ -531,9 +530,9 @@ model.print_architecture();
               }
                
              
-             // let (logits, _) = model.forward(&input_batch,  None)?;
-              let (logits, next_state) = model.forward(&input_batch, current_state)?;
-               current_state = Some(next_state.into_iter().map(|s| s.map(|state| state.detach())).collect());
+              //  let (logits, _) = model.forward(&input_batch,  None)?;
+               let (logits, next_state) = model.forward(&input_batch, current_state)?;
+                current_state = Some(next_state.into_iter().map(|s| s.map(|state| state.detach())).collect());
 
 
                 // Optimization
@@ -555,12 +554,7 @@ model.print_architecture();
 
                 let grads = loss.backward()?;
 
-                /* 
-                // --- GRADIENT CLIPPING (Sugerido para prevenir estancamiento) ---
-                // Para xLSTM es vital clipear gradientes debido a las funciones exponenciales
-                */
-
-                // Ahora los optimizadores usarán los gradientes clipeados
+                // Ahora los optimizadores usarán los gradientes
                 optim_slstm.step(&grads)?;
                 optim_mlstm.step(&grads)?;
                 optim_other.step(&grads)?;
@@ -573,15 +567,14 @@ model.print_architecture();
                     io::stdout().flush().unwrap();
                 
                 }
-
-
-               if batch_idx % 42 == 0 && batch_idx > 0 {
+            
+                 if batch_idx % 5 == 0 && batch_idx > 0 {
                     let factor = step_factor as f32; //  errores
 
                     if aumentando {
 
                         dropout /= factor;           // 1. Actualizamos la variable local
-                       // model.dropout = dropout;     // 2. Se la pasamos al model
+                        model.dropout = dropout;     // 2. Se la pasamos al model
                         current_lr /= step_factor; // El LR suele ser f64, está bien
                         if current_lr >= lr_max {
                             current_lr = lr_max;
@@ -595,8 +588,8 @@ model.print_architecture();
                             aumentando = true; 
                         }
                     }
-                    dropout = 0.0;//dropout.clamp(0.05, 0.20);
-                   // model.blocks.iter_mut().for_each(|b| b.dropout_prob = dropout);
+                    dropout = dropout.clamp(0.001, 0.007);
+                    model.blocks.iter_mut().for_each(|b| b.dropout_prob = dropout);
             
                     println!(
                         "\n[CYCLIC SCHEDULER] LR: {:.2e} | Dropout: {:.4} | Dirección: {}", 
@@ -606,7 +599,7 @@ model.print_architecture();
                     );
                 } 
 
-        optim_mlstm = AdamW::new(mlstm_params.clone(),ParamsAdamW {lr: current_lr,..Default::default() }  )?;
+                optim_mlstm = AdamW::new(mlstm_params.clone(),ParamsAdamW {lr: current_lr,..Default::default() }  )?;
                                         
             }
             println!();

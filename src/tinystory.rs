@@ -31,13 +31,14 @@ pub struct Tokenizer {
 impl Tokenizer {
     pub fn from_text(text: &str, vocab_size: usize) -> Result<Self> {
         let special_tokens_strings = vec![
-            "[ENG]".to_string(),
-            "[SEP]".to_string(),
-            "[ESP]".to_string(),
+          //  "[ENG]".to_string(),
+         //   "[SEP]".to_string(),
+         //   "[ESP]".to_string(),
             "[EOS]".to_string(),
-            "<PAD>".to_string(),
+            "<|endoftext|>".to_string(),
+        //    "<PAD>".to_string(),
         ];
-
+ 
         let special_tokens: Vec<AddedToken> = special_tokens_strings
             .iter()
             .map(|t| AddedToken::from(t, true))
@@ -262,10 +263,14 @@ fn generate_threaded_text(
         }
         let averaged_logits = (combined_logits / (model_logits.len() as f64))?;
 
-        let next_token = sample_from_logits(&averaged_logits, 0.8)?;
+        let next_token = sample_from_logits(&averaged_logits, 0.5)?;
         current_tokens.push(next_token);
         
         if let Some(t) = tokenizer.id_to_token(next_token) {
+            if t == "<|endoftext|>" {
+                println!("  |Fin de la prediccion|");
+                break;
+            }
             let mut clean_token = t.clone();
             if clean_token.contains('Ċ') || clean_token.contains('Ġ') {
                clean_token = clean_token.replace("Ċ", "\n").replace("Ġ", " ");
@@ -288,7 +293,7 @@ fn main() -> Result<()> {
     }
 
     let text_file = &args[1];
-    let tokenizer_path = "cortex_tokenizer.json";
+    let tokenizer_path = "tinystory_cortex_tokenizer.json";
     let target_vocab_size = 1024;
     let device = Device::Cpu;
 
@@ -305,7 +310,7 @@ fn main() -> Result<()> {
     let text = fs::read_to_string(text_file)?;
     let tokens = tokenizer.encode(&text);
 
-    let hidden_size = 480; 
+    let hidden_size = 256; 
     let num_layers = 1;
     let num_blocks = 1;
     let output_size = vocab_size; 
@@ -336,13 +341,13 @@ fn main() -> Result<()> {
                 params.push(var.clone());
             }
         }
-        let optimizer = AdamW::new(params, ParamsAdamW { lr: 8e-3, ..Default::default() })?;
+        let optimizer = AdamW::new(params, ParamsAdamW { lr: 1.3e-4, ..Default::default() })?;
         
         models.push(model);
         varmaps.push(vm);
         optimizers.push(optimizer);
         
-        let m_path = format!("cortex_model_{}.safetensors", i);
+        let m_path = format!("tinystory_cortex_{}.safetensors", i);
         if Path::new(&m_path).exists() {
             varmaps[i-1].load(&m_path)?;
         }
@@ -350,7 +355,7 @@ fn main() -> Result<()> {
 
     let mut all_models_exist = true;
     for i in 1..=num_models {
-        if !Path::new(&format!("cortex_model_{}.safetensors", i)).exists() {
+        if !Path::new(&format!("tinystory_cortex_{}.safetensors", i)).exists() {
             all_models_exist = false;
             break;
         }
@@ -379,7 +384,7 @@ fn main() -> Result<()> {
         // Ajusta este vector según `num_models`
         let mut train_mask = vec![true; num_models];
         // Ejemplo: Congelar el primero si hay más de 1 modelo
-       // if num_models > 1 { train_mask[1] = false; }
+        //if num_models > 1 { train_mask[2] = false; }
         
         println!("Iniciando entrenamiento MULTI-HILO ({} WorkThreads)...", num_models);
         print!("Estado modelos: ");
@@ -387,13 +392,18 @@ fn main() -> Result<()> {
             print!("M{}={} ", i+1, if train_mask[i] { "ACTIVO" } else { "FROZEN" });
         }
         println!();
+    //let mut batch_idx = 0;
+    let mut start_batch = 1900; // Configurable: Start batch index
 
     for epoch in 0..num_epochs {
         let mut total_losses = vec![0.0f32; num_models];
         let mut total_ensemble_loss = 0.0f32;
         let start_time = Instant::now();
 
-        for batch_idx in 0..num_batches {
+        // Si es la segunda epoch en adelante, empezamos desde 0
+        if epoch > 0 { start_batch = 0; }
+
+        for batch_idx in start_batch..num_batches {
             let start_idx = batch_idx * batch_size * stride;
             let (input_batch, target_batch) = create_batch(&tokens, start_idx, batch_size, seq_length, stride, &device)?;
             let target_flat = target_batch.reshape((batch_size * seq_length,))?;
@@ -449,40 +459,44 @@ fn main() -> Result<()> {
             });
 
             if batch_idx % 1 == 0 {
+                let current_steps = (batch_idx - start_batch + 1) as f32;
                 let mut log_str = format!("\rEpoch {}/{} | Batch {}/{} | ", epoch+1, num_epochs, batch_idx, num_batches);
                 for i in 0..num_models {
-                    log_str.push_str(&format!("L{}={:.3} ", i+1, total_losses[i] / (batch_idx+1) as f32));
+                    log_str.push_str(&format!("L{}={:.3} ", i+1, total_losses[i] / current_steps));
                 }
-                log_str.push_str(&format!("| L_Ens={:.3}", total_ensemble_loss / (batch_idx+1) as f32));
+                log_str.push_str(&format!("| L_Ens={:.3}", total_ensemble_loss / current_steps));
                 
                 print!("{}", log_str);
                 io::stdout().flush()?;
             }
-            if batch_idx % 20 == 0 {
-            for i in 0..num_models { varmaps[i].save(&format!("cortex_model_{}.safetensors", i+1))?; }
-            let mut rng = rand::rng();
-        let ridx = rng.random_range(0..tokens.len() - 10);
-        let seed = tokenizer.decode(&tokens[ridx..ridx+5]);
-        println!("  Seed: '{}'", seed);
-              
-            let gen_sample = generate_threaded_text(&models, &tokenizer, &seed, 100, &device, &thread_barrier)?;
-            println!("  Ensemble Thread: {}\n", gen_sample);
-        }
-            
-        }
+
+            // Save and generate every 50 batches, avoiding the immediate start batch
+            if batch_idx > start_batch && batch_idx % 50 == 0 {
+                println!("\nGuardando checkpoint en batch {}...", batch_idx);
+                for i in 0..num_models { varmaps[i].save(&format!("tinystory_cortex_{}.safetensors", i+1))?; }
+                
+                // Generar con ensemble hilos
+                let mut rng = rand::rng();
+                let ridx = rng.random_range(0..tokens.len() - 10);
+                let seed = tokenizer.decode(&tokens[ridx..ridx+5]);
+                println!("  Seed: '{}'", seed);
+                let gen_sample = generate_threaded_text(&models, &tokenizer, &seed, 300, &device, &thread_barrier)?;
+                println!("  Ensemble Thread: {}\n", gen_sample);
+            }
+        } // Fin loop batch_idx
 
         println!("\nEpoch {} OK ({:.1}s). Guardando...", epoch+1, start_time.elapsed().as_secs_f32());
-        for i in 0..num_models { varmaps[i].save(&format!("cortex_model_{}.safetensors", i+1))?; }
+        for i in 0..num_models { varmaps[i].save(&format!("tinystory_cortex_{}.safetensors", i+1))?; }
 
         // Generar con ensemble hilos
         let mut rng = rand::rng();
         let ridx = rng.random_range(0..tokens.len() - 10);
         let seed = tokenizer.decode(&tokens[ridx..ridx+5]);
         println!("  Seed: '{}'", seed);
-        let gen_sample = generate_threaded_text(&models, &tokenizer, &seed, 100, &device, &thread_barrier)?;
-            println!("  Ensemble Thread: {}\n", gen_sample);
-        }
-    }
+        let gen_sample = generate_threaded_text(&models, &tokenizer, &seed, 300, &device, &thread_barrier)?;
+        println!("  Ensemble Thread: {}\n", gen_sample);
+    } // Fin loop epoch
+} // Fin if train_mode
 
     // Barrera para inferencia (si no se creó en el entrenamiento)
     let thread_barrier = Arc::new(Barrier::new(num_models));

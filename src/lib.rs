@@ -50,11 +50,15 @@ mod gate_controller;
 mod mlstm;
 mod model;
 mod slstm;
+mod min_gru;
+mod min_lstm;
 
 pub use block::{BlockType, XLstmblock, XLstmblockConfig, LSTMState};
 pub use gate_controller::GateController;
 pub use mlstm::{MLstm, MLstmcell, MLstmconfig, MLstmstate};
 pub use model::{LstmType, XLstm, XLstmconfig};
 pub use slstm::{SLstm, SLstmcell, SLstmconfig, SLstmstate};
+pub use min_gru::{MinGru, MinGruConfig};
+pub use min_lstm::{MinLstm, MinLstmConfig};
 
 pub const VERSION: &str = "0.1.0";

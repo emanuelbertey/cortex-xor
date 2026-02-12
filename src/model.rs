@@ -19,6 +19,10 @@ pub enum LstmType {
     SLSTM,
     /// All blocks use mLSTM
     MLSTM,
+    /// All blocks use MinGRU
+    MinGRU,
+    /// All blocks use MinLSTM
+    MinLSTM,
     /// Alternating pattern: sLSTM, mLSTM, sLSTM, mLSTM, ...
     Alternate,
     /// Custom pattern specified by user
@@ -169,6 +173,8 @@ impl XLstmconfig {
         match &self.lstm_type {
             LstmType::SLSTM => vec![BlockType::SLSTM; self.num_blocks],
             LstmType::MLSTM => vec![BlockType::MLSTM; self.num_blocks],
+            LstmType::MinGRU => vec![BlockType::MinGRU; self.num_blocks],
+            LstmType::MinLSTM => vec![BlockType::MinLSTM; self.num_blocks],
             LstmType::Alternate => (0..self.num_blocks)
                 .map(|i| {
                     if i % 2 == 0 {
@@ -253,11 +259,19 @@ impl XLstm {
             x = output;
             hidden_states[i] = new_state;
         }
+/*
+Sugerencia: Si el Loss sigue siendo alto, 
+añade una LayerNorm justo antes de la linear1 en el output_head.
+ Los bloques residuales pueden hacer que la magnitud de x crezca
+  conforme pasan los bloques,
+   y normalizar justo antes del "head" final estabiliza
+    mucho las probabilidades de la Softmax.
+*/
 
         // Apply output head
         let (linear1, _dropout, linear2) = &self.output_head;
         x = linear1.forward(&x)?;
-        //x = x.gelu()?;
+        x = x.gelu()?;
       //  x = dropout.forward(&x, true)?;
         let output = linear2.forward(&x)?;
 
@@ -302,6 +316,8 @@ impl XLstm {
             let type_str = match block.get_type() {
                 BlockType::SLSTM => "sLSTM",
                 BlockType::MLSTM => "mLSTM",
+                BlockType::MinGRU => "MinGRU",
+                BlockType::MinLSTM => "MinLSTM",
             };
             println!("    Block {}: {}", i + 1, type_str);
         }

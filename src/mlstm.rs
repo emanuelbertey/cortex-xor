@@ -1,44 +1,62 @@
-/*
-# RWKV-7 / mLSTM Hybrid
-
-This module implements a hybrid RNN cell that uses the matrix state structure of mLSTM
-but applies the Delta Rule update mechanism from RWKV-7.
+/*!
+# mLSTM: Matrix Long Short-Term Memory (Candle)
+Implementación definitiva con Gates Exponenciales y Estabilización Numérica.
+Variables de ajuste de estabilidad configurables (bias, dropout, clamp, epsilon, etc.).
 */
 
 use candle_core::{Tensor, Device, Result, DType};
-use candle_nn::{Dropout, Module, VarBuilder, Linear, LayerNorm, ops, linear_no_bias, layer_norm};
+use candle_nn::{Dropout, VarBuilder, ops};
+use serde::{Deserialize, Serialize};
 
-/// State for the Hybrid Cell
 #[derive(Clone, Debug)]
 pub struct MLstmstate {
-    /// Cell state - matrix of shape [`batch_size`, `num_heads`, `head_dim`, `head_dim`]
-    pub cell: Tensor,
-    /// Hidden state - vector of shape [`batch_size`, `hidden_size`]
-    pub hidden: Tensor,
+    pub cell: Tensor,         // [B, Hh, Hd, Hd]
+    pub hidden: Tensor,       // [B, H]
+    pub normalizer: Tensor,   // [B, Hh, Hd]
+    pub max_gate_log: Tensor, // [B, Hh, 1]
 }
 
 impl MLstmstate {
-    /// Create a new state
-    pub fn new(cell: Tensor, hidden: Tensor) -> Self {
-        Self { cell, hidden }
+    pub fn new(cell: Tensor, hidden: Tensor, normalizer: Tensor, max_gate_log: Tensor) -> Self {
+        Self { cell, hidden, normalizer, max_gate_log }
     }
-
     pub fn detach(&self) -> Self {
         Self {
             cell: self.cell.detach(),
             hidden: self.hidden.detach(),
+            normalizer: self.normalizer.detach(),
+            max_gate_log: self.max_gate_log.detach(),
         }
     }
 }
 
-/// Configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MLstmconfig {
     pub d_input: usize,
     pub d_hidden: usize,
     pub num_layers: usize,
     pub num_heads: usize,
     pub dropout: f32,
+    // --- Variables de ajuste de estabilidad ---
+    /// Desviación estándar para inicialización de pesos (Kaiming o Normal).
+    pub weight_stdev: f64,
+    /// Bias aplicado al forget gate para controlar la retención de memoria.
+    pub forget_bias: f32,
+    /// Bias aplicado al input gate exponencial para controlar velocidad de escritura.
+    pub input_gate_bias: f32,
+    /// Epsilon para estabilización numérica en la normalización.
+    pub epsilon: f64,
+    /// Clamp inferior para log-gates (evita log(0)).
+    pub log_clamp: f64,
+    /// Clamp máximo para exponenciales (evita overflow en exp gates).
+    pub exp_clamp: f64,
+    /// Clamp para el denominador de normalización.
+    pub norm_clamp_min: f64,
+    pub norm_clamp_max: f64,
+    /// Escala de los gates exponenciales (divide la pre-activación).
+    pub exp_gate_scale: f64,
+    /// Si true, usar bias separado por gate (input, forget, output).
+    pub use_separate_bias: bool,
 }
 
 impl MLstmconfig {
@@ -49,6 +67,17 @@ impl MLstmconfig {
             num_layers,
             num_heads,
             dropout: 0.0,
+            // Valores por defecto sugeridos para estabilidad
+            weight_stdev: 0.02,
+            forget_bias: 0.5,
+            input_gate_bias: 0.0,
+            epsilon: 1e-6,
+            log_clamp: 1e-4,
+            exp_clamp: 20.0,
+            norm_clamp_min: 1e-6,
+            norm_clamp_max: 1e10,
+            exp_gate_scale: 2.0,
+            use_separate_bias: true,
         }
     }
 
@@ -57,266 +86,263 @@ impl MLstmconfig {
         self
     }
 
+    /// Configura los parámetros de estabilidad numérica principales.
+    pub fn with_stability(mut self, weight_stdev: f64, forget_bias: f32, epsilon: f64) -> Self {
+        self.weight_stdev = weight_stdev;
+        self.forget_bias = forget_bias;
+        self.epsilon = epsilon;
+        self
+    }
+
+    /// Configura los clamps para gates exponenciales y normalización.
+    pub fn with_clamps(mut self, log_clamp: f64, exp_clamp: f64, norm_min: f64, norm_max: f64) -> Self {
+        self.log_clamp = log_clamp;
+        self.exp_clamp = exp_clamp;
+        self.norm_clamp_min = norm_min;
+        self.norm_clamp_max = norm_max;
+        self
+    }
+
+    /// Configura la escala del gate exponencial.
+    pub fn with_exp_gate_scale(mut self, scale: f64) -> Self {
+        self.exp_gate_scale = scale;
+        self
+    }
+
+    /// Configura el bias del input gate exponencial.
+    pub fn with_input_gate_bias(mut self, bias: f32) -> Self {
+        self.input_gate_bias = bias;
+        self
+    }
+
     pub fn init(&self, vb: VarBuilder) -> Result<MLstm> {
         let mut layers = Vec::with_capacity(self.num_layers);
         for i in 0..self.num_layers {
             let input_size = if i == 0 { self.d_input } else { self.d_hidden };
             let layer_vb = vb.pp(format!("layer_{}", i));
-            layers.push(MLstmcell::new(input_size, self.d_hidden, self.num_heads, layer_vb)?);
+            layers.push(MLstmcell::new(input_size, self.d_hidden, self.num_heads, self, layer_vb)?);
         }
-
         Ok(MLstm {
             layers,
             dropout_layer: Dropout::new(self.dropout),
-            d_input: self.d_input,
             d_hidden: self.d_hidden,
             num_layers: self.num_layers,
-            num_heads: self.num_heads,
             dropout: self.dropout,
         })
     }
 }
 
-/// Main Layer
 #[derive(Debug)]
 pub struct MLstm {
     pub layers: Vec<MLstmcell>,
     pub dropout_layer: Dropout,
-    pub d_input: usize,
     pub d_hidden: usize,
     pub num_layers: usize,
-    pub num_heads: usize,
     pub dropout: f32,
 }
 
 impl MLstm {
-    pub fn forward(
-        &self,
-        input_seq: &Tensor,
-        states: Option<Vec<MLstmstate>>,
-    ) -> Result<(Tensor, Vec<MLstmstate>)> {
-        let (batch_size, _seq_length, _) = input_seq.dims3()?;
-        let device = input_seq.device();
-
-        let mut hidden_states = match states {
-            Some(s) => s,
-            None => self.init_hidden(batch_size, device)?,
-        };
-        
-        let mut layer_input = input_seq.clone();
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let old_state = &hidden_states[layer_idx];
-            let (h_seq, new_state) = layer.forward_sequence(&layer_input, old_state)?;
-            hidden_states[layer_idx] = new_state;
-
-            layer_input = if layer_idx < self.num_layers - 1 && self.dropout > 0.0 {
-                self.dropout_layer.forward(&h_seq, false)?
-            } else {
-                h_seq
+    pub fn forward(&self, input_seq: &Tensor, states: Option<Vec<MLstmstate>>) -> Result<(Tensor, Vec<MLstmstate>)> {
+        let (b, seq_len, _) = input_seq.dims3()?;
+        if seq_len > 1 {
+            let mut x = input_seq.clone();
+            let mut final_states = Vec::new();
+            for (i, layer) in self.layers.iter().enumerate() {
+                let (out, last_s) = layer.forward_dual(&x)?;
+                final_states.push(last_s.detach());
+                x = out;
+                if i < self.num_layers - 1 && self.dropout > 0.0 {
+                    x = self.dropout_layer.forward(&x, true)?;
+                }
+            }
+            Ok((x, final_states))
+        } else {
+            let device = input_seq.device();
+            let mut hidden_states = match states {
+                Some(s) => s,
+                None => self.init_hidden(b, device)?,
             };
+            let mut layer_input = input_seq.squeeze(1)?;
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let (h_new, new_state) = layer.forward_step(&layer_input, &hidden_states[layer_idx])?;
+                hidden_states[layer_idx] = new_state.detach();
+                layer_input = h_new;
+            }
+            Ok((layer_input.unsqueeze(1)?, hidden_states))
         }
-
-        Ok((layer_input, hidden_states))
     }
 
-    fn init_hidden(&self, batch_size: usize, device: &Device) -> Result<Vec<MLstmstate>> {
-        let head_dim = self.d_hidden / self.num_heads;
-        (0..self.num_layers)
-            .map(|_| {
-                Ok(MLstmstate::new(
-                    Tensor::zeros((batch_size, self.num_heads, head_dim, head_dim), DType::F32, device)?,
-                    Tensor::zeros((batch_size, self.d_hidden), DType::F32, device)?,
-                ))
-            })
-            .collect()
+    pub fn init_hidden(&self, batch_size: usize, device: &Device) -> Result<Vec<MLstmstate>> {
+        let head_dim = self.d_hidden / self.layers[0].num_heads;
+        (0..self.num_layers).map(|_| {
+            Ok(MLstmstate::new(
+                Tensor::zeros((batch_size, self.layers[0].num_heads, head_dim, head_dim), DType::F32, device)?,
+                Tensor::zeros((batch_size, self.d_hidden), DType::F32, device)?,
+                Tensor::zeros((batch_size, self.layers[0].num_heads, head_dim), DType::F32, device)?,
+                Tensor::zeros((batch_size, self.layers[0].num_heads, 1), DType::F32, device)?,
+            ))
+        }).collect()
     }
 }
 
-/// Cell implementation with RWKV-7 Delta Rule logic
 #[derive(Debug)]
 pub struct MLstmcell {
-    pub w_k: Linear, // Key
-    pub w_v: Linear, // Value
-    pub w_r: Linear, // Receptance (like Output gate/Query)
-    pub w_a: Linear, // Alpha (Learning Rate gate)
-    pub w_w: Linear, // Decay rate (Time-decay)
-    
-    pub ln: LayerNorm,
-    
-    pub input_size: usize,
-    pub hidden_size: usize,
+    pub weight_ih: Tensor,
+    pub bias: Tensor,
     pub num_heads: usize,
+    pub head_dim: usize,
+    pub hidden_size: usize,
+    // Parámetros de ajuste almacenados
+    pub forget_bias: f32,
+    pub input_gate_bias: f32,
+    pub epsilon: f64,
+    pub log_clamp: f64,
+    pub exp_clamp: f64,
+    pub norm_clamp_min: f64,
+    pub norm_clamp_max: f64,
+    pub exp_gate_scale: f64,
 }
 
 impl MLstmcell {
-    pub fn new(
-        input_size: usize,
-        hidden_size: usize,
-        num_heads: usize,
-        vb: VarBuilder,
-    ) -> Result<Self> {
+    pub fn new(input_size: usize, hidden_size: usize, num_heads: usize, config: &MLstmconfig, vb: VarBuilder) -> Result<Self> {
         let head_dim = hidden_size / num_heads;
 
-        // Projections
-        // Note: Using linear_no_bias to match the matrix concept cleanly.
-        let w_k = linear_no_bias(input_size, hidden_size, vb.pp("w_k"))?;
-        let w_v = linear_no_bias(input_size, hidden_size, vb.pp("w_v"))?;
-        let w_r = linear_no_bias(input_size, hidden_size, vb.pp("w_r"))?;
-        let w_a = linear_no_bias(input_size, hidden_size, vb.pp("w_a"))?;
-        let w_w = linear_no_bias(input_size, hidden_size, vb.pp("w_w"))?;
+        let weight_init = candle_nn::init::Init::Randn {
+            mean: 0.0,
+            stdev: config.weight_stdev,
+        };
+        // xLSTM mLSTM necesita 6 proyecciones: q, k, v, i (input gate), f (forget gate), o (output gate)
+        let weight_ih = vb.get_with_hints((6 * hidden_size, input_size), "weight_ih", weight_init)?;
 
-        let ln = layer_norm(head_dim, 1e-5, vb.pp("ln"))?;
+        // Construir bias con valores diferenciados por gate si use_separate_bias
+        let bias = if config.use_separate_bias {
+            // [q_bias(0) | k_bias(0) | v_bias(0) | i_bias(input_gate_bias) | f_bias(forget_bias) | o_bias(0)]
+            let mut bias_vals = vec![0.0f32; 6 * hidden_size];
+            // chunk 3: input gate bias
+            for i in (3 * hidden_size)..(4 * hidden_size) {
+                bias_vals[i] = config.input_gate_bias;
+            }
+            // chunk 4: forget gate bias
+            for i in (4 * hidden_size)..(5 * hidden_size) {
+                bias_vals[i] = config.forget_bias;
+            }
+            let bias_tensor = Tensor::from_vec(bias_vals, (6 * hidden_size,), weight_ih.device())?;
+            let bias_param = vb.get_with_hints(6 * hidden_size, "bias", candle_nn::init::Init::Const(0.0))?;
+            bias_param.broadcast_add(&bias_tensor)?
+        } else {
+            vb.get_with_hints(6 * hidden_size, "bias", candle_nn::init::Init::Const(0.0))?
+        };
 
         Ok(Self {
-            w_k,
-            w_v,
-            w_r,
-            w_a,
-            w_w,
-            ln,
-            input_size,
-            hidden_size,
+            weight_ih,
+            bias,
             num_heads,
+            head_dim,
+            hidden_size,
+            forget_bias: config.forget_bias,
+            input_gate_bias: config.input_gate_bias,
+            epsilon: config.epsilon,
+            log_clamp: config.log_clamp,
+            exp_clamp: config.exp_clamp,
+            norm_clamp_min: config.norm_clamp_min,
+            norm_clamp_max: config.norm_clamp_max,
+            exp_gate_scale: config.exp_gate_scale,
         })
     }
 
-    /// Forward pass processing the sequence step-by-step to apply the Delta Rule
-    pub fn forward_sequence(
-        &self,
-        input_seq: &Tensor,
-        state: &MLstmstate,
-    ) -> Result<(Tensor, MLstmstate)> {
-        let (batch_size, seq_len, _) = input_seq.dims3()?;
-        let head_dim = self.hidden_size / self.num_heads;
-
-        // 1. Pre-calculate all projections for speed (Parallel Projections)
-        // [B, S, D] -> [B, S, H, D_head]
-        let k_seq = self.project(input_seq, &self.w_k, batch_size, seq_len, head_dim)?;
-        let v_seq = self.project(input_seq, &self.w_v, batch_size, seq_len, head_dim)?;
-        let r_seq = self.project(input_seq, &self.w_r, batch_size, seq_len, head_dim)?;
+    pub fn forward_dual(&self, x: &Tensor) -> Result<(Tensor, MLstmstate)> {
+        let (b, s, d) = x.dims3()?;
+        let device = x.device();
         
-        // Alpha (gate): Use Sigmoid as per request
-        let a_seq_pre = self.project(input_seq, &self.w_a, batch_size, seq_len, head_dim)?;
-        let a_seq = ops::sigmoid(&a_seq_pre)?;
-
-        // Decay (w): Use Sigmoid to ensure 0..1 stability
-        let w_seq_pre = self.project(input_seq, &self.w_w, batch_size, seq_len, head_dim)?;
-        let w_seq = ops::sigmoid(&w_seq_pre)?;
+        let x_flat = x.reshape((b * s, d))?;
+        let all_gates_flat = x_flat.matmul(&self.weight_ih.t()?)?.broadcast_add(&self.bias)?;
+        let all_gates = all_gates_flat.reshape((b, s, 6 * self.hidden_size))?;
+        let chunks = all_gates.chunk(6, 2)?;
         
-        // Stabilize K: Scale by 1/sqrt(head_dim) to prevent update explosion
-        // This acts as normalizing the "step size" of the delta rule.
-        let k_seq = (k_seq / (head_dim as f64).sqrt())?;
+        let q = chunks[0].reshape((b, s, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let k = chunks[1].reshape((b, s, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let v = chunks[2].reshape((b, s, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        // chunks[3] = i (input gate) - no usado en forward_dual (modo attention)
+        // chunks[4] = f (forget gate) - no usado en forward_dual
+        let o = ops::sigmoid(&chunks[5])?; // output gate
 
-        // 2. Sequential Scan (Delta Rule)
-        let mut current_cell = state.cell.clone(); // [B, H, D, D]
-        let mut outputs = Vec::with_capacity(seq_len);
-
-        for t in 0..seq_len {
-            // Slice timestep t: [B, H, 1, D]
-            let k_t = k_seq.narrow(2, t, 1)?; // [B, H, 1, D]
-            let v_t = v_seq.narrow(2, t, 1)?; // [B, H, 1, D]
-            let r_t = r_seq.narrow(2, t, 1)?; // [B, H, 1, D]
-            let a_t = a_seq.narrow(2, t, 1)?; // [B, H, 1, D]
-            let w_t = w_seq.narrow(2, t, 1)?; // [B, H, 1, D]
-
-            // Reshape for matrix ops
-            // k_t: [B, H, 1, D]
-            // current_cell: [B, H, D, D]
-            
-            // Prediction = State * k
-            // [B, H, D, D] matmul [B, H, D, 1] (k_t transposed) -> [B, H, D, 1]
-            // Wait, k_t is [1, D]. We want State @ k^T.
-            // Let's align dimensions accurately.
-            // k_t_vec: [B, H, D, 1]
-            let k_t_vec = k_t.permute((0, 1, 3, 2))?; // [B, H, D, 1]
-            let prediction = current_cell.matmul(&k_t_vec)?; // [B, H, D, 1]
-
-            // Delta = v - prediction
-            // v_t is [B, H, 1, D]. We need [B, H, D, 1] for subtraction or transpose v.
-            let v_t_vec = v_t.permute((0, 1, 3, 2))?; // [B, H, D, 1]
-            let delta = (v_t_vec - &prediction)?; // [B, H, D, 1]
-            
-            // Update State
-            // 1. Decay: state = state * w_t
-            // w_t is [B, H, 1, D]. We want to broadcast to [B, H, D, D].
-            // Usually decay applies to the memory rows? Or Uniform?
-            // User: "self.state *= &w".
-            // If w is per-channel D, we broadcast [1, D] to [D, D] (columns) or [D, 1] (rows).
-            // RWKV typically decays keys. 
-            // We'll broadcast w_t [B, H, 1, D] to [B, H, D, D] (columns decayed).
-            // Or w_t_vec [B, H, D, 1].
-            // Let's decay the whole matrix elementwise via broadcast.
-            current_cell = current_cell.broadcast_mul(&w_t)?;
-
-            // 2. Add: state += delta @ k
-            // delta: [B, H, D, 1]
-            // k_t: [B, H, 1, D]
-            // delta @ k_t -> [B, H, D, D]
-            // Modulated by alpha 'a'.
-            // User: update_state_with_delta(&delta, &k, &a)
-            // Implicitly: delta @ k * a?
-            // "v - S*K" is a vector. "K" is a vector. Outer product.
-            // (v - S u) \otimes v ? No (v - S k) \otimes k.
-            // alpha scales the update speed.
-            let update_term = delta.matmul(&k_t)?; // [B, H, D, D]
-            // Apply alpha scaling. a_t: [B, H, 1, D]. Broadcast to [B, H, D, D]?
-            let update_weighted = update_term.broadcast_mul(&a_t)?;
-            
-            current_cell = (current_cell + update_weighted)?;
-
-            // Output Generation
-            // r * (State * k)
-            // Note: User code calculates `r * self.state.dot(&k)`.
-            // Does it use the *updated* state or old state?
-            // Usually output comes from updated state (current timestep view).
-            // "Standard" RNN: h_t = f(x_t, h_{t-1}). Output y_t = g(h_t).
-            // So we use current_cell (updated).
-            
-            // Re-calculate projection with new state
-            // prediction_new = State_new * k
-            let pred_new = current_cell.matmul(&k_t_vec)?; // [B, H, D, 1]
-            
-            // Apply Receptance r
-            // r_t_vec: [B, H, D, 1]
-            let r_t_vec = r_t.permute((0, 1, 3, 2))?;
-            let out_vec = r_t_vec.broadcast_mul(&pred_new)?; // [B, H, D, 1]
-
-            // Norm? User didn't specify, but mLSTM/RWKV usually expects LayerNorm on the output vector.
-            // Flatten to [B, H, D]
-            let out_flat = out_vec.squeeze(3)?; 
-            outputs.push(out_flat);
-        }
-
-        // Stack outputs: [B, S, H, D]
-        let seq_tensor = Tensor::stack(&outputs, 1)?; // [B, S, H, D_head]
+        // Scaled dot-product para estabilizar
+        let scale = (self.head_dim as f64).sqrt().recip();
+        let q_scaled = (q * scale)?;
         
-        // Apply LayerNorm
-        // ln expects [..., D]. 
-        let ln_out = self.ln.forward(&seq_tensor)?;
+        let k_t = k.transpose(2, 3)?.contiguous()?;
+        let scores = q_scaled.matmul(&k_t)?;
+        
+        let mask = self.get_causal_mask(s, device)?;
+        let attn = ops::softmax(&scores.broadcast_add(&mask)?, 3)?;
+        
+        let out_heads = attn.matmul(&v)?;
+        let out = out_heads.transpose(1, 2)?.contiguous()?.reshape((b, s, self.hidden_size))?;
+        let h_final = out.broadcast_mul(&o)?;
 
-        // Reshape to [B, S, Hidden]
-        let final_out = ln_out.flatten_from(2)?;
-
-        // Final state
-        // last output hidden state for 'hidden' field
-        let last_hidden = final_out.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
-
-        Ok((final_out, MLstmstate::new(current_cell, last_hidden)))
+        let last_s = MLstmstate::new(
+            Tensor::zeros((b, self.num_heads, self.head_dim, self.head_dim), DType::F32, device)?,
+            h_final.narrow(1, s - 1, 1)?.squeeze(1)?,
+            Tensor::zeros((b, self.num_heads, self.head_dim), DType::F32, device)?,
+            Tensor::zeros((b, self.num_heads, 1), DType::F32, device)?,
+        );
+        Ok((h_final, last_s))
     }
 
-    fn project(
-        &self, 
-        input: &Tensor, 
-        layer: &Linear, 
-        b: usize, 
-        s: usize, 
-        h_dim: usize
-    ) -> Result<Tensor> {
-        // [B, S, H*D] -> [B, S, H, D] -> [B, H, S, D]
-        layer.forward(input)?
-            .reshape((b, s, self.num_heads, h_dim))?
-            .permute((0, 2, 1, 3))?
-            .contiguous()
+    pub fn forward_step(&self, input: &Tensor, state: &MLstmstate) -> Result<(Tensor, MLstmstate)> {
+        let (b, _) = input.dims2()?;
+        let device = input.device();
+        let gates = input.matmul(&self.weight_ih.t()?)?.broadcast_add(&self.bias)?;
+        let chunks = gates.chunk(6, 1)?;
+        
+        // xLSTM mLSTM: proyecciones separadas para q, k, v, i, f, o
+        let q = chunks[0].reshape((b, self.num_heads, self.head_dim))?;
+        let k = chunks[1].reshape((b, self.num_heads, self.head_dim))?;
+        let v = chunks[2].reshape((b, self.num_heads, self.head_dim))?;
+        let i_raw = chunks[3].reshape((b, self.num_heads, self.head_dim))?;
+        let f_raw = chunks[4].reshape((b, self.num_heads, self.head_dim))?;
+        let o = ops::sigmoid(&chunks[5])?;
+
+        // 1. Input Gate Exponencial (Clave del xLSTM)
+        // Escalamos por exp_gate_scale para controlar la magnitud, con clamp para estabilidad
+        let i_scaled = (i_raw / self.exp_gate_scale)?;
+        let i_clamped = i_scaled.clamp(-self.exp_clamp, self.exp_clamp)?;
+        let i_gate = i_clamped.exp()?;
+
+        // 2. Forget Gate sigmoidal (con bias configurable ya aplicado en la inicialización)
+        let f_gate = ops::sigmoid(&f_raw)?;
+
+        // 3. Actualización de Matriz de Memoria: C_t = f_t ⊙ C_{t-1} + i_t ⊙ (v ⊗ k)
+        let mat_update = v.unsqueeze(3)?.matmul(&k.unsqueeze(2)?)?;
+
+        let c_new = state.cell
+            .broadcast_mul(&f_gate.unsqueeze(3)?)?
+            .add(&mat_update.broadcast_mul(&i_gate.unsqueeze(3)?)?)?;
+
+        // 4. Normalizador: n_t = f_t ⊙ n_{t-1} + i_t ⊙ k
+        let n_new = state.normalizer.broadcast_mul(&f_gate)?
+            .add(&k.broadcast_mul(&i_gate)?)?;
+
+        // 5. Retrieval: h̃_t = C_t @ q
+        let h_raw = c_new.matmul(&q.unsqueeze(3)?)?.squeeze(3)?;
+        
+        // 6. Normalización estabilizada: h_t = h̃_t / max(|n_t · q|, ε)
+        let dot_prod = n_new.broadcast_mul(&q)?.sum_keepdim(2)?;
+        let eps_tensor = Tensor::new(&[self.epsilon as f32], device)?;
+        let den = dot_prod.abs()?.broadcast_add(&eps_tensor)?;
+        let den = den.clamp(self.norm_clamp_min, self.norm_clamp_max)?;
+        let h_norm = h_raw.broadcast_div(&den)?;
+        
+        // 7. Output gate: h_final = o_t ⊙ h_t
+        let h_final = h_norm.reshape((b, self.hidden_size))?.broadcast_mul(&o)?;
+
+        Ok((h_final.clone(), MLstmstate::new(c_new, h_final, n_new, state.max_gate_log.clone())))
+    }
+
+    fn get_causal_mask(&self, s: usize, device: &Device) -> Result<Tensor> {
+        let mask: Vec<f32> = (0..s)
+            .flat_map(|i| (0..s).map(move |j| if j <= i { 0.0 } else { -1e9 }))
+            .collect();
+        Tensor::from_vec(mask, (1, 1, s, s), device)
     }
 }

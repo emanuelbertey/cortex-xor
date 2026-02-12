@@ -56,6 +56,23 @@ pub struct SLstmconfig {
     pub d_hidden: usize,
     pub num_layers: usize,
     pub dropout: f32,
+    // --- Variables de ajuste de estabilidad ---
+    /// Desviación estándar para inicializ ación de pesos.
+    pub weight_stdev: f64,
+    /// Bias para forget gate (logit).
+    pub forget_bias: f32,
+    /// Bias para input gate (logit).
+    pub input_bias: f32,
+    /// Epsilon para evitar división por cero en normalización.
+    pub epsilon: f64,
+    /// Clamp mínimo para exponenciales estabilizadas (evitar underflow).
+    pub exp_clamp_min: f64,
+    /// Clamp máximo para exponenciales (evitar overflow).
+    pub exp_clamp_max: f64,
+    /// Valor inicial del estabilizador m_0.
+    pub stabilizer_init: f32,
+    /// Si true, aplicar bias diferenciados por gate.
+    pub use_separate_bias: bool,
 }
 
 impl SLstmconfig {
@@ -65,6 +82,15 @@ impl SLstmconfig {
             d_hidden,
             num_layers,
             dropout: 0.0,
+            // Valores por defecto para estabilidad
+            weight_stdev: 0.02,
+            forget_bias: 0.0,
+            input_bias: 0.0,
+            epsilon: 1e-6,
+            exp_clamp_min: -30.0,
+            exp_clamp_max: 0.0,
+            stabilizer_init: -10.0,
+            use_separate_bias: true,
         }
     }
 
@@ -73,12 +99,33 @@ impl SLstmconfig {
         self
     }
 
+    /// Configura parámetros de estabilidad numérica.
+    pub fn with_stability(mut self, weight_stdev: f64, forget_bias: f32, epsilon: f64) -> Self {
+        self.weight_stdev = weight_stdev;
+        self.forget_bias = forget_bias;
+        self.epsilon = epsilon;
+        self
+    }
+
+    /// Configura clamps para exponenciales.
+    pub fn with_exp_clamps(mut self, min: f64, max: f64) -> Self {
+        self.exp_clamp_min = min;
+        self.exp_clamp_max = max;
+        self
+    }
+
+    /// Configura valor inicial del estabilizador.
+    pub fn with_stabilizer_init(mut self, val: f32) -> Self {
+        self.stabilizer_init = val;
+        self
+    }
+
     pub fn init(&self, vb: VarBuilder) -> Result<SLstm> {
         let mut layers = Vec::with_capacity(self.num_layers);
         for i in 0..self.num_layers {
             let input_size = if i == 0 { self.d_input } else { self.d_hidden };
             let layer_vb = vb.pp(format!("layer_{}", i));
-            layers.push(SLstmcell::new(input_size, self.d_hidden, layer_vb)?);
+            layers.push(SLstmcell::new(input_size, self.d_hidden, self, layer_vb)?);
         }
 
         Ok(SLstm {
@@ -88,6 +135,7 @@ impl SLstmconfig {
             d_hidden: self.d_hidden,
             num_layers: self.num_layers,
             dropout: self.dropout,
+            stabilizer_init: self.stabilizer_init,
         })
     }
 }
@@ -101,6 +149,7 @@ pub struct SLstm {
     pub d_hidden: usize,
     pub num_layers: usize,
     pub dropout: f32,
+    pub stabilizer_init: f32,
 }
 
 impl SLstm {
@@ -149,7 +198,8 @@ impl SLstm {
                     // xLSTM paper: n_0 = 0 (Equation 13 & 14 starting sum from 0)
                     Tensor::zeros((batch_size, self.d_hidden), DType::F32, device)?,
                     Tensor::zeros((batch_size, self.d_hidden), DType::F32, device)?,
-                    Tensor::zeros((batch_size, self.d_hidden), DType::F32, device)?,
+                    // m_0 configurable (permite ajuste fino)
+                    (Tensor::ones((batch_size, self.d_hidden), DType::F32, device)? * self.stabilizer_init)?,
                 ))
             })
             .collect()
@@ -164,33 +214,55 @@ pub struct SLstmcell {
     pub bias: Tensor,
     pub input_size: usize,
     pub hidden_size: usize,
+    // Parámetros de ajuste
+    pub forget_bias: f32,
+    pub input_bias: f32,
+    pub epsilon: f64,
+    pub exp_clamp_min: f64,
+    pub exp_clamp_max: f64,
 }
 
 impl SLstmcell {
     pub fn new(
         input_size: usize,
         hidden_size: usize,
+        config: &SLstmconfig,
         vb: VarBuilder, 
     ) -> Result<Self> {
         // xLSTM paper suggests standard initialization for LSTM-like gates.
+        let weight_init = candle_nn::init::Init::Randn {
+            mean: 0.0,
+            stdev: config.weight_stdev,
+        };
+        
         let weight_ih = vb.get_with_hints(
             (4 * hidden_size, input_size), 
             "weight_ih", 
-            candle_nn::init::DEFAULT_KAIMING_NORMAL 
+            weight_init
         )?;
         
         let weight_hh = vb.get_with_hints(
             (4 * hidden_size, hidden_size), 
             "weight_hh", 
-            candle_nn::init::DEFAULT_KAIMING_NORMAL
+            weight_init
         )?;
 
-        // Bias 0.0 means e^0 = 1.0 initially for i and f gates.
-        let bias = vb.get_with_hints(
-            4 * hidden_size, 
-            "bias", 
-            candle_nn::init::Init::Const(0.0)
-        )?;
+        // Bias con valores diferenciados si use_separate_bias
+        let bias = if config.use_separate_bias {
+            // [i_bias | f_bias | z_bias(0) | o_bias(0)]
+            let mut bias_vals = vec![0.0f32; 4 * hidden_size];
+            for i in 0..hidden_size {
+                bias_vals[i] = config.input_bias;
+            }
+            for i in hidden_size..(2 * hidden_size) {
+                bias_vals[i] = config.forget_bias;
+            }
+            let bias_tensor = Tensor::from_vec(bias_vals, (4 * hidden_size,), weight_ih.device())?;
+            let bias_param = vb.get_with_hints(4 * hidden_size, "bias", candle_nn::init::Init::Const(0.0))?;
+            bias_param.broadcast_add(&bias_tensor)?
+        } else {
+            vb.get_with_hints(4 * hidden_size, "bias", candle_nn::init::Init::Const(0.0))?
+        };
 
         Ok(Self {
             weight_ih,
@@ -198,6 +270,11 @@ impl SLstmcell {
             bias,
             input_size,
             hidden_size,
+            forget_bias: config.forget_bias,
+            input_bias: config.input_bias,
+            epsilon: config.epsilon,
+            exp_clamp_min: config.exp_clamp_min,
+            exp_clamp_max: config.exp_clamp_max,
         })
     }
 
@@ -231,11 +308,11 @@ impl SLstmcell {
         let m_prev_plus_f = stabilizer.add(f_gate)?;
         let m_new = m_prev_plus_f.maximum(i_gate)?; 
 
-        // 4. Stabilized Exponential Gating
+        // 4. Stabilized Exponential Gating (con clamps configurables)
         // i_t' = exp(i_gate - m_t)
         // f_t' = exp(f_gate + m_prev - m_t)
-        let i_exp = (i_gate - &m_new)?.clamp(-30.0, 0.0)?.exp()?;
-        let f_exp = (m_prev_plus_f - &m_new)?.clamp(-30.0, 0.0)?.exp()?;
+        let i_exp = (i_gate - &m_new)?.clamp(self.exp_clamp_min, self.exp_clamp_max)?.exp()?;
+        let f_exp = (m_prev_plus_f - &m_new)?.clamp(self.exp_clamp_min, self.exp_clamp_max)?.exp()?;
 
         // Activaciones no-exponenciales
         let z = z_gate.tanh()?;      // Input content (z en el paper)
@@ -247,10 +324,10 @@ impl SLstmcell {
         let c_new = ((&f_exp * cell)? + (&i_exp * z)?)?;
         let n_new = ((f_exp * normalizer)? + i_exp)?;
 
-        // 6. Normalization and Output (Eq. 16-17)
+        // 6. Normalization and Output (Eq. 16-17) con epsilon configurable
         // Hidden state h_t = o_t * (c_t / n_t)
         // xLSTM paper: "The normalization ensures that h_t is bounded, making tanh unnecessary."
-        let n_safe = n_new.clamp(1e-6, f32::MAX)?; 
+        let n_safe = n_new.clamp(self.epsilon, f32::MAX)?; 
         let h_new = (o * (c_new.clone() / n_safe)?)?;
 
         let new_state = SLstmstate::new(c_new, n_new, h_new.clone(), m_new);

@@ -23,6 +23,7 @@ use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
 
 use xlstm::{LstmType, XLstm, XLstmconfig, BlockType};
 use rand::Rng;
+use rand::seq::SliceRandom;
 
 /// Tokenizador profesional usando la librería 'tokenizers' de Hugging Face
 pub struct Tokenizer {
@@ -370,9 +371,9 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
     let output_size = vocab_size; 
     let dropout = 0.0;
 
-    let seq_length = 256; 
+    let seq_length = 128; 
     let batch_size = 16; 
-    let stride = 256;     
+    let stride = 128;     
     let num_epochs = 50;
     let num_heads = 2;
 
@@ -389,7 +390,7 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
         .with_vocab_size(vocab_size)
         .with_dropout(dropout)
         .with_num_heads(num_heads)
-        .with_lstm_type(LstmType::SLSTM) 
+        .with_lstm_type(LstmType::MinGRU) 
         .with_use_projection(true);   
 
     let model_file_path = Path::new(model_path);
@@ -442,6 +443,8 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
         let parsed_block_types = match config.lstm_type {
             LstmType::SLSTM => vec![BlockType::SLSTM; num_blocks],
             LstmType::MLSTM => vec![BlockType::MLSTM; num_blocks],
+            LstmType::MinGRU => vec![BlockType::MinGRU; num_blocks],
+            LstmType::MinLSTM => vec![BlockType::MinLSTM; num_blocks],
             LstmType::Alternate => (0..num_blocks)
                 .map(|i| if i % 2 == 0 { BlockType::SLSTM } else { BlockType::MLSTM })
                 .collect(),
@@ -450,6 +453,8 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
 
         let mut slstm_params = Vec::new();
         let mut mlstm_params = Vec::new();
+        let mut mingru_params = Vec::new();
+        let mut minlstm_params = Vec::new();
         let mut other_params = Vec::new();
 
         let data = varmap.data().lock().unwrap();
@@ -463,6 +468,8 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
                                  match parsed_block_types[idx] {
                                      BlockType::SLSTM => slstm_params.push(var.clone()),
                                      BlockType::MLSTM => mlstm_params.push(var.clone()),
+                                     BlockType::MinGRU => mingru_params.push(var.clone()),
+                                     BlockType::MinLSTM => minlstm_params.push(var.clone()),
                                  }
                              } else { other_params.push(var.clone()); }
                          } else { other_params.push(var.clone()); }
@@ -474,8 +481,11 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
 
         // Tasas de aprendizaje recomendadas para xLSTM: 
         // sLSTM suele tolerar LRs más altas, mLSTM requiere más cuidado.
-        let mut optim_slstm = AdamW::new(slstm_params, ParamsAdamW { lr: 1e-4, ..Default::default() })?;
+        // MinGRU y MinLSTM necesitan LRs extremadamente bajos por estabilidad numérica
+        let mut optim_slstm = AdamW::new(slstm_params, ParamsAdamW { lr: 8e-3, ..Default::default() })?;
         let mut optim_mlstm = AdamW::new(mlstm_params, ParamsAdamW { lr: 8e-5, ..Default::default() })?;
+        let mut optim_mingru = AdamW::new(mingru_params, ParamsAdamW { lr: 1e-4, ..Default::default() })?;
+        let mut optim_minlstm = AdamW::new(minlstm_params, ParamsAdamW { lr: 5e-6, ..Default::default() })?;
         let mut optim_other = AdamW::new(other_params, ParamsAdamW { lr: 2e-4, ..Default::default() })?;
 
         println!("Iniciando entrenamiento...\n");
@@ -488,7 +498,13 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
             let mut correct = 0;
             let mut total = 0;
            // let mut current_state = None;
-            for batch_idx in 0..num_batches {
+            let mut batch_order: Vec<usize> = (0..num_batches).collect();
+            {
+                let mut rng = rand::rng();
+                batch_order.shuffle(&mut rng);
+            }
+
+            for (batch_pos, batch_idx) in batch_order.into_iter().enumerate() {
                 let epoch_start = Instant::now();
                 let current_batch_start_seq = batch_idx * batch_size;
                 let current_batch_size = (batch_size).min(num_actual_sequences - current_batch_start_seq);
@@ -525,8 +541,9 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
                 // Cross Entropy
                 // Candle cross_entropy expects logits and targets (u32 indices)
                 let loss = candle_nn::loss::cross_entropy(&logits_flat, &target_flat)?;
-                
-                total_loss += loss.to_scalar::<f32>()?;
+                let batch_loss = loss.to_scalar::<f32>()?;
+
+                total_loss += batch_loss;
                 num_losses += 1;
 
                 // Accuracy
@@ -538,19 +555,23 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
                 let grads = loss.backward()?;
 
                 /* 
-                // --- GRADIENT CLIPPING (Sugerido para prevenir estancamiento) ---
+                // --- GRADIENT CLIPPING (Desactivado temporalmente) ---
                 // Para xLSTM es vital clipear gradientes debido a las funciones exponenciales
+                // Nota: La API de GradStore en Candle no tiene los métodos esperados
+                // Por ahora nos basamos en LR bajo y clamping para estabilidad
                 */
 
-                // Ahora los optimizadores usarán los gradientes clipeados
+                // Ahora los optimizadores usarán los gradientes
                 optim_slstm.step(&grads)?;
                 optim_mlstm.step(&grads)?;
+                optim_mingru.step(&grads)?;
+                optim_minlstm.step(&grads)?;
                 optim_other.step(&grads)?;
 
-                if batch_idx % 1 == 0 || batch_idx == num_batches - 1 {
+                if batch_pos % 1 == 0 || batch_pos == num_batches - 1 {
                     let elapsed = epoch_start.elapsed().as_secs_f32();
-                    print!("\r  -> Batch [{}/{}] Loss: {:.4} Acc: {:.2}% ({:.1}s)", 
-                        batch_idx + 1, num_batches, total_loss / (num_losses as f32),
+                    print!("\r  -> Batch [{}/{}] Loss: {:.4} (avg {:.4}) Acc: {:.2}% ({:.1}s)", 
+                        batch_pos + 1, num_batches, batch_loss, total_loss / (num_losses as f32),
                         100.0 * correct as f32 / total as f32, elapsed);
                     io::stdout().flush().unwrap();
                

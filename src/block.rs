@@ -12,7 +12,7 @@ use candle_core::{Tensor, Result};
 use candle_nn::{Dropout, Module, VarBuilder, LayerNorm, Linear, layer_norm, linear};
 use serde::{Deserialize, Serialize};
 
-use crate::{MLstm, MLstmconfig, MLstmstate, SLstm, SLstmconfig, SLstmstate};
+use crate::{MLstm, MLstmconfig, MLstmstate, SLstm, SLstmconfig, SLstmstate, MinGru, MinGruConfig, MinLstm, MinLstmConfig};
 
 /// Type of LSTM block
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +21,10 @@ pub enum BlockType {
     SLSTM,
     /// Matrix LSTM
     MLSTM,
+    /// MinGRU
+    MinGRU,
+    /// MinLSTM
+    MinLSTM,
 }
 
 /// Configuration for xLSTM block
@@ -80,6 +84,18 @@ impl XLstmblockConfig {
                 let lstm = lstm_config.init(vb.pp("lstm"))?;
                 LSTMVariant::MLSTM(lstm)
             }
+            BlockType::MinGRU => {
+                let gru_config = MinGruConfig::new(self.input_size)
+                    .with_expansion_factor(2.0);
+                let gru = gru_config.init(vb.pp("lstm"))?;
+                LSTMVariant::MinGRU(gru)
+            }
+            BlockType::MinLSTM => {
+                let lstm_config = MinLstmConfig::new(self.input_size)
+                    .with_expansion_factor(1.0);
+                let lstm = lstm_config.init(vb.pp("lstm"))?;
+                LSTMVariant::MinLSTM(lstm)
+            }
         };
 
         let proj = linear(self.hidden_size, self.input_size, vb.pp("proj"))?;
@@ -95,22 +111,30 @@ impl XLstmblockConfig {
     }
 }
 
-/// Enum to hold either sLSTM or mLSTM
+/// Enum to hold either sLSTM, mLSTM, MinGRU, or MinLSTM
 #[derive(Debug)]
 pub enum LSTMVariant {
     /// Scalar LSTM variant
     SLSTM(SLstm),
     /// Matrix LSTM variant
     MLSTM(MLstm),
+    /// MinGRU variant
+    MinGRU(MinGru),
+    /// MinLSTM variant
+    MinLSTM(MinLstm),
 }
 
-/// Enum for holding either sLSTM or mLSTM states
+/// Enum for holding either sLSTM, mLSTM, MinGRU, or MinLSTM states
 #[derive(Debug, Clone)]
 pub enum LSTMState {
     /// States for sLSTM
     SLSTM(Vec<SLstmstate>),
     /// States for mLSTM
     MLSTM(Vec<MLstmstate>),
+    /// States for MinGRU (single tensor)
+    MinGRU(Option<Tensor>),
+    /// States for MinLSTM (single tensor)
+    MinLSTM(Option<Tensor>),
 }
 
 impl LSTMState {
@@ -118,6 +142,8 @@ impl LSTMState {
         match self {
             LSTMState::SLSTM(v) => LSTMState::SLSTM(v.iter().map(|s| s.detach()).collect()),
             LSTMState::MLSTM(v) => LSTMState::MLSTM(v.iter().map(|m| m.detach()).collect()),
+            LSTMState::MinGRU(t) => LSTMState::MinGRU(t.as_ref().map(|t| t.detach())),
+            LSTMState::MinLSTM(t) => LSTMState::MinLSTM(t.as_ref().map(|t| t.detach())),
         }
     }
 }
@@ -155,7 +181,7 @@ impl XLstmblock {
             x
         };
 
-        // 3. PASO POR LA VARIANTE (mLSTM o sLSTM)
+        // 3. PASO POR LA VARIANTE (mLSTM, sLSTM, MinGRU, o MinLSTM)
         let (lstm_output, new_state) = match (&self.lstm, state) {
             (LSTMVariant::SLSTM(lstm), s) => {
                 let s_val = match s { Some(LSTMState::SLSTM(st)) => Some(st), _ => None };
@@ -167,7 +193,22 @@ impl XLstmblock {
                 let (out, state) = lstm.forward(&x, s_val)?;
                 (out, Some(LSTMState::MLSTM(state)))
             }
-            _ => candle_core::bail!("Mismatched state/variant"),
+            (LSTMVariant::MinGRU(gru), s) => {
+                let s_val = match s { 
+                    Some(LSTMState::MinGRU(Some(ref st))) => Some(st), 
+                    _ => None 
+                };
+                let (out, state) = gru.forward(&x, s_val, false)?;
+                (out, Some(LSTMState::MinGRU(state)))
+            }
+            (LSTMVariant::MinLSTM(lstm), s) => {
+                let s_val = match s { 
+                    Some(LSTMState::MinLSTM(Some(ref st))) => Some(st), 
+                    _ => None 
+                };
+                let (out, state) = lstm.forward(&x, s_val, false)?;
+                (out, Some(LSTMState::MinLSTM(state)))
+            }
         };
 
         // 4. PROYECCIÓN Y DROPOUT DE SALIDA
@@ -176,8 +217,8 @@ impl XLstmblock {
         // 5. RESIDUAL CONNECTION (Pre-Norm Style)
         // Sumamos el resultado a 'input_seq' original (el que no fue normalizado)
         // Esto crea el "highway" de gradientes limpio.
-       // let output = (output + input_seq)?;
-       let output = ((output * 0.8)? + input_seq)?;
+       let output = (output + input_seq )?;
+         // let output = ((output * 0.8)? + input_seq )?;
 
         Ok((output, new_state))
     }
@@ -188,6 +229,8 @@ impl XLstmblock {
         match &self.lstm {
             LSTMVariant::SLSTM(_) => BlockType::SLSTM,
             LSTMVariant::MLSTM(_) => BlockType::MLSTM,
+            LSTMVariant::MinGRU(_) => BlockType::MinGRU,
+            LSTMVariant::MinLSTM(_) => BlockType::MinLSTM,
         }
     }
 }
@@ -221,6 +264,8 @@ mod tests {
         let m_state = MLstmstate::new(
              Tensor::zeros((1, 4, 16, 16), DType::F32, &device)?,
              Tensor::zeros((1, 10), DType::F32, &device)?,
+             Tensor::zeros((1, 4, 16), DType::F32, &device)?,
+             Tensor::zeros((1, 4, 1), DType::F32, &device)?,
         );
         let lstm_state_m = LSTMState::MLSTM(vec![m_state]);
         let detached_m = lstm_state_m.detach();

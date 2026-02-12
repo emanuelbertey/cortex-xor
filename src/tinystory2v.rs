@@ -1,12 +1,13 @@
 #![recursion_limit = "256"]
 
 /*!
-Cortex Thread: Ensemble of 3 sLSTM models with Multi-threaded Training and Generation.
-Uses std::thread::scope for parallel processing and shared memory.
+TinyStory2V: Ensemble de 3 sLSTM paralelos + Modelo Final de 2 bloques sLSTM.
+Arquitectura: 3 modelos paralelos -> Promedio -> Modelo de 2 bloques sLSTM -> Salida
+Usa std::thread::scope para procesamiento paralelo y memoria compartida.
 */
 
-use candle_core::{Device, Tensor, DType};
-use candle_nn::{VarBuilder, VarMap, Optimizer, AdamW, ParamsAdamW};
+use candle_core::{Device, Tensor, DType, Module};
+use candle_nn::{VarBuilder, VarMap, Optimizer, AdamW, ParamsAdamW, Module as _};
 use anyhow::Result;
 use std::fs;
 use std::io::{self, Write};
@@ -31,13 +32,14 @@ pub struct Tokenizer {
 impl Tokenizer {
     pub fn from_text(text: &str, vocab_size: usize) -> Result<Self> {
         let special_tokens_strings = vec![
-            "[ENG]".to_string(),
-            "[SEP]".to_string(),
-            "[ESP]".to_string(),
+          //  "[ENG]".to_string(),
+         //   "[SEP]".to_string(),
+         //   "[ESP]".to_string(),
             "[EOS]".to_string(),
-            "<PAD>".to_string(),
+            "<|endoftext|>".to_string(),
+        //    "<PAD>".to_string(),
         ];
-
+ 
         let special_tokens: Vec<AddedToken> = special_tokens_strings
             .iter()
             .map(|t| AddedToken::from(t, true))
@@ -185,9 +187,10 @@ fn sample_from_logits(averaged_logits: &Tensor, temperature: f32) -> Result<usiz
     Ok(indices[0])
 }
 
-/// Generación EN PARALELO de los 3 modelos
+/// Generación EN PARALELO de los 3 modelos + Modelo Final de 2 bloques sLSTM
 fn generate_threaded_text(
     models: &[XLstm],
+    final_model: &XLstm,
     tokenizer: &Tokenizer,
     seed_text: &str,
     length: usize,
@@ -202,6 +205,7 @@ fn generate_threaded_text(
     }
 
     let mut current_states: Vec<Option<Vec<Option<LSTMState>>>> = vec![None; models.len()];
+    let mut final_model_state: Option<Vec<Option<LSTMState>>> = None;
     let mut current_tokens = seed_tokens;
 
     for i in 0..length {
@@ -255,17 +259,38 @@ fn generate_threaded_text(
             current_states[m_idx] = Some(next_state.into_iter().map(|s| s.map(|state| state.detach())).collect());
         }
 
-        // Promediar logits (Voting)
+        // 1. Promediar logits de expertos (1024)
         let mut combined_logits = model_logits[0].clone();
         for j in 1..model_logits.len() {
-            combined_logits = (combined_logits + &model_logits[j])?;
+            combined_logits = combined_logits.add(&model_logits[j])?;
         }
-        let averaged_logits = (combined_logits / (model_logits.len() as f64))?;
+        // Forzamos a que sea plano [1024] por si algún hilo devolvió dimensión extra
+        let averaged_logits_ens = (combined_logits / (model_logits.len() as f64))?.flatten_all()?;
+        
+        // 2. Residuo One-Hot (1024) del token de entrada
+        let v_size = tokenizer.vocab_size();
+        let mut residue_vec = vec![0.0f32; v_size];
+        let last_token_id = current_tokens.last().copied().unwrap_or(0);
+        residue_vec[last_token_id] = 1.0;
+        let residue = Tensor::from_vec(residue_vec, (v_size,), device)?;
+        
+        // 3. Sumar (Salida Expertos + Entrada Residuo) -> [1, 1, 1024]
+        let combined_input = averaged_logits_ens.add(&residue)?.unsqueeze(0)?.unsqueeze(0)?;
+        
+        // 4. Modelo Final procesa la suma directamente
+        let (final_output, next_final_state) = final_model.forward(&combined_input, final_model_state)?;
+        final_model_state = Some(next_final_state.into_iter().map(|s| s.map(|state| state.detach())).collect());
+        
+        let final_logits = final_output.squeeze(0)?.squeeze(0)?;
 
-        let next_token = sample_from_logits(&averaged_logits, 0.8)?;
+        let next_token = sample_from_logits(&final_logits, 0.9)?;
         current_tokens.push(next_token);
         
         if let Some(t) = tokenizer.id_to_token(next_token) {
+            if t == "<|endoftext|>" {
+                println!("  |Fin de la prediccion|");
+                break;
+            }
             let mut clean_token = t.clone();
             if clean_token.contains('Ċ') || clean_token.contains('Ġ') {
                clean_token = clean_token.replace("Ċ", "\n").replace("Ġ", " ");
@@ -278,17 +303,17 @@ fn generate_threaded_text(
 }
 
 fn main() -> Result<()> {
-    println!("Cortex Thread: Ensemble de 3 Modelos con HILOS y Semáforos");
-    println!("==========================================================\n");
+    println!("TinyStory2V: Ensemble de 3 sLSTM Paralelos + Modelo Final de 2 Bloques sLSTM");
+    println!("=============================================================================\n");
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Uso: cargo run --bin cortexthread -- <archivo.txt>");
+        eprintln!("Uso: cargo run --bin tinystory2v -- <archivo.txt>");
         std::process::exit(1);
     }
 
     let text_file = &args[1];
-    let tokenizer_path = "cortex_tokenizer.json";
+    let tokenizer_path = "tinystory2v_tokenizer.json";
     let target_vocab_size = 1024;
     let device = Device::Cpu;
 
@@ -305,13 +330,13 @@ fn main() -> Result<()> {
     let text = fs::read_to_string(text_file)?;
     let tokens = tokenizer.encode(&text);
 
-    let hidden_size = 480; 
+    let hidden_size = 256; // Cambiado a 1024 para que el block ya proyecte con 1024
     let num_layers = 1;
     let num_blocks = 1;
     let output_size = vocab_size; 
-    let seq_length = 128; 
+    let seq_length = 160; 
     let batch_size = 16; 
-    let stride = 128;     
+    let stride = 160;     
     let num_epochs = 20;
 
     let config = XLstmconfig::new(hidden_size, hidden_size, num_layers, num_blocks, output_size)
@@ -336,34 +361,90 @@ fn main() -> Result<()> {
                 params.push(var.clone());
             }
         }
-        let optimizer = AdamW::new(params, ParamsAdamW { lr: 8e-3, ..Default::default() })?;
+        let optimizer = AdamW::new(params, ParamsAdamW { lr: 6e-5, ..Default::default() })?;
         
         models.push(model);
         varmaps.push(vm);
         optimizers.push(optimizer);
         
-        let m_path = format!("cortex_model_{}.safetensors", i);
-        if Path::new(&m_path).exists() {
-            varmaps[i-1].load(&m_path)?;
+        let m_path_parallel = format!("tinystory2v_parallel_{}.safetensors", i);
+        let m_path_base = format!("tinystory_cortex_{}.safetensors", i);
+        
+        if Path::new(&m_path_parallel).exists() {
+            varmaps[i-1].load(&m_path_parallel)?;
+            println!("Modelo paralelo {} cargado desde checkpoint: {}", i, m_path_parallel);
+        } else if Path::new(&m_path_base).exists() {
+            varmaps[i-1].load(&m_path_base)?;
+            println!("Modelo paralelo {} cargado desde modelo base: {}", i, m_path_base);
         }
     }
 
+    // Crear el modelo final de 2 bloques sLSTM
+    // Configuración: Entrada 1024 (logits + residue), Hidden 320, 2 bloques
+    // IMPORTANTE: NO usamos vocab_size para que el modelo no cree un embedding 
+    // y acepte la suma de floats (residuo) directamente.
+    let final_config = XLstmconfig::new(vocab_size, 320, num_layers, 2, output_size)
+        .with_lstm_type(LstmType::SLSTM)
+        .with_use_projection(true); 
+    
+    let mut final_vm = VarMap::new();
+    let final_vb = VarBuilder::from_varmap(&final_vm, DType::F32, &device);
+    let final_model = final_config.init(final_vb)?;
+    
+    let mut final_params = Vec::new();
+    {
+        let data = final_vm.data().lock().unwrap();
+        for (_, var) in data.iter() {
+            final_params.push(var.clone());
+        }
+    }
+    let mut final_optimizer = AdamW::new(final_params, ParamsAdamW { lr: 2.5e-3, ..Default::default() })?;
+    
+    let final_model_path = "tinystory2v_final.safetensors";
+    if Path::new(final_model_path).exists() {
+        if let Err(e) = final_vm.load(final_model_path) {
+            println!("\nAviso: No se pudo cargar el modelo final anterior ({}). Se inicializará uno nuevo para evitar errores de arquitectura.", e);
+        }
+    }
+
+    // Verificar si existen los modelos base o checkpoints previos
     let mut all_models_exist = true;
     for i in 1..=num_models {
-        if !Path::new(&format!("cortex_model_{}.safetensors", i)).exists() {
+        let has_parallel = Path::new(&format!("tinystory2v_parallel_{}.safetensors", i)).exists();
+        let has_base = Path::new(&format!("tinystory_cortex_{}.safetensors", i)).exists();
+        if !has_parallel && !has_base {
             all_models_exist = false;
             break;
         }
     }
+    // El modelo final no es obligatorio para considerar que "existen los modelos" si estamos entrenando
+    // pero si queremos inferir, sí lo es. Ajustamos la lógica de train_mode después.
+    let final_exists = Path::new(final_model_path).exists();
 
     let mut train_mode = true;
+    let mut train_only_final = false;
+    
     if all_models_exist {
-        print!("Modelos encontrados. ¿Deseas (e)ntrenar o solo (i)nferir? [e/i]: ");
+        print!("Modelos encontrados. ¿Deseas (e)ntrenar, entrenar solo (f)inal, o solo (i)nferir? [e/f/i]: ");
         io::stdout().flush()?;
         let mut choice = String::new();
         io::stdin().read_line(&mut choice)?;
-        if choice.trim().to_lowercase() == "i" {
-            train_mode = false;
+        let choice_lower = choice.trim().to_lowercase();
+        
+        if choice_lower == "i" {
+            if !final_exists {
+                println!("Error: No se puede inferir sin el modelo final entrenado.");
+                train_mode = true;
+            } else {
+                train_mode = false;
+            }
+        } else if choice_lower == "f" {
+            train_mode = true;
+            train_only_final = true;
+            println!("Modo: Entrenar SOLO el modelo final (modelos paralelos congelados)");
+        } else {
+            println!("Modo: Entrenar TODO (modelos paralelos + modelo final)");
+            train_only_final = false;
         }
     }
 
@@ -377,9 +458,9 @@ fn main() -> Result<()> {
         // Configuración de congelamiento DINÁMICA
         // true = Entrena, false = Congelado
         // Ajusta este vector según `num_models`
-        let mut train_mask = vec![true; num_models];
+        let train_mask = vec![true; num_models];
         // Ejemplo: Congelar el primero si hay más de 1 modelo
-       // if num_models > 1 { train_mask[1] = false; }
+        //if num_models > 1 { train_mask[2] = false; }
         
         println!("Iniciando entrenamiento MULTI-HILO ({} WorkThreads)...", num_models);
         print!("Estado modelos: ");
@@ -387,13 +468,19 @@ fn main() -> Result<()> {
             print!("M{}={} ", i+1, if train_mask[i] { "ACTIVO" } else { "FROZEN" });
         }
         println!();
+    //let mut batch_idx = 0;
+    let mut start_batch = 2400; // Configurable: Start batch index
 
     for epoch in 0..num_epochs {
         let mut total_losses = vec![0.0f32; num_models];
         let mut total_ensemble_loss = 0.0f32;
+        let mut total_final_loss = 0.0f32;
         let start_time = Instant::now();
 
-        for batch_idx in 0..num_batches {
+        // Si es la segunda epoch en adelante, empezamos desde 0
+        if epoch > 0 { start_batch = 0; }
+
+        for batch_idx in start_batch..num_batches {
             let start_idx = batch_idx * batch_size * stride;
             let (input_batch, target_batch) = create_batch(&tokens, start_idx, batch_size, seq_length, stride, &device)?;
             let target_flat = target_batch.reshape((batch_size * seq_length,))?;
@@ -402,7 +489,7 @@ fn main() -> Result<()> {
             let input_ref = &input_batch;
             let target_ref = &target_flat;
 
-            // --- ENTRENAMIENTO EN PARALELO ---
+            // --- ENTRENAMIENTO EN PARALELO (o solo forward si train_only_final) ---
             std::thread::scope(|s| {
                 let mut handles = Vec::new();
                 
@@ -411,23 +498,25 @@ fn main() -> Result<()> {
 
                 for (m_idx, (model, optimizer)) in zip_iter.enumerate() {
                     let b = &thread_barrier;
-                    let should_train = train_mask[m_idx];
+                    let should_train = train_mask[m_idx] && !train_only_final;
                     
                     handles.push(s.spawn(move || {
                         b.wait(); // Esperar a que todos estén listos
 
                         let (logits, _) = model.forward(input_ref, None)?;
                         let logits_flat = logits.reshape((batch_size * seq_length, vocab_size))?;
-                        let loss = candle_nn::loss::cross_entropy(&logits_flat, target_ref)?;
                         
-                        // Solo entrenamos si el modelo no está congelado
+                        // Calculamos loss para monitoreo (siempre), pero solo backward si no es train_only_final
+                        let loss = candle_nn::loss::cross_entropy(&logits_flat, target_ref)?;
+                        let loss_val = loss.to_scalar::<f32>()?;
+                        
                         if should_train {
                             let grads = loss.backward()?;
                             optimizer.step(&grads)?;
                         }
                         
                         b.wait(); // Esperar a que todos terminen el heavy lift
-                        Ok::<(f32, Tensor), anyhow::Error>((loss.to_scalar::<f32>()?, logits_flat.detach()))
+                        Ok::<(f32, Tensor), anyhow::Error>((loss_val, logits_flat.detach()))
                     }));
                 }
                 
@@ -438,56 +527,89 @@ fn main() -> Result<()> {
                     batch_logits.push(logits_val);
                 }
 
-                // Ensemble Loss Calculation (Averaging Logits)
+                // 1. Promedio Expertos (1024)
                 let mut combined_logits = batch_logits[0].clone();
                 for j in 1..batch_logits.len() {
-                    combined_logits = (combined_logits + &batch_logits[j]).unwrap();
+                    combined_logits = combined_logits.add(&batch_logits[j]).unwrap();
                 }
-                let averaged_logits = (combined_logits / (batch_logits.len() as f64)).unwrap();
-                let ens_loss = candle_nn::loss::cross_entropy(&averaged_logits, target_ref).unwrap().to_scalar::<f32>().unwrap();
-                total_ensemble_loss += ens_loss;
+                let averaged_logits_ens = (combined_logits / (batch_logits.len() as f64)).unwrap();
+                
+                // 2. Residuo One-Hot (1024) para el batch
+                let input_ref_flat = input_ref.flatten_all().unwrap();
+                let mut one_hot_data = vec![0.0f32; batch_size * seq_length * vocab_size];
+                let input_indices = input_ref_flat.to_vec1::<u32>().unwrap();
+                for (i, &idx) in input_indices.iter().enumerate() {
+                    one_hot_data[i * vocab_size + (idx as usize)] = 1.0;
+                }
+                let residue_flat = Tensor::from_vec(one_hot_data, (batch_size * seq_length, vocab_size), &device).unwrap();
+                
+                // 3. Suma (Salida Expertos + Entrada Residuo) -> [batch, seq, 1024]
+                let combined_input_flat = averaged_logits_ens.add(&residue_flat).unwrap();
+                let combined_input = combined_input_flat.reshape((batch_size, seq_length, vocab_size)).unwrap();
+                
+                let (final_output, _) = final_model.forward(&combined_input, None).unwrap();
+                let final_logits_flat = final_output.reshape((batch_size * seq_length, vocab_size)).unwrap();
+                
+                // 4. Loss Final
+                let final_loss = candle_nn::loss::cross_entropy(&final_logits_flat, target_ref).unwrap();
+                let final_loss_val = final_loss.to_scalar::<f32>().unwrap();
+                total_final_loss += final_loss_val;
+                
+                // Monitoreo del ensemble
+                let ensemble_loss = candle_nn::loss::cross_entropy(&averaged_logits_ens, target_ref).unwrap();
+                total_ensemble_loss += ensemble_loss.to_scalar::<f32>().unwrap();
+                
+                // Entrenar el modelo final
+                let final_grads = final_loss.backward().unwrap();
+                final_optimizer.step(&final_grads).unwrap();
             });
 
             if batch_idx % 1 == 0 {
+                let current_steps = (batch_idx - start_batch + 1) as f32;
                 let mut log_str = format!("\rEpoch {}/{} | Batch {}/{} | ", epoch+1, num_epochs, batch_idx, num_batches);
                 for i in 0..num_models {
-                    log_str.push_str(&format!("L{}={:.3} ", i+1, total_losses[i] / (batch_idx+1) as f32));
+                    log_str.push_str(&format!("L{}={:.3} ", i+1, total_losses[i] / current_steps));
                 }
-                log_str.push_str(&format!("| L_Ens={:.3}", total_ensemble_loss / (batch_idx+1) as f32));
+                log_str.push_str(&format!("| L_Ens={:.3} | L_Final={:.3}", total_ensemble_loss / current_steps, total_final_loss / current_steps));
                 
                 print!("{}", log_str);
                 io::stdout().flush()?;
             }
-            if batch_idx % 20 == 0 {
-            for i in 0..num_models { varmaps[i].save(&format!("cortex_model_{}.safetensors", i+1))?; }
-            let mut rng = rand::rng();
-        let ridx = rng.random_range(0..tokens.len() - 10);
-        let seed = tokenizer.decode(&tokens[ridx..ridx+5]);
-        println!("  Seed: '{}'", seed);
-              
-            let gen_sample = generate_threaded_text(&models, &tokenizer, &seed, 100, &device, &thread_barrier)?;
-            println!("  Ensemble Thread: {}\n", gen_sample);
-        }
-            
-        }
+
+            // Save and generate every 50 batches, avoiding the immediate start batch
+            if batch_idx > start_batch && batch_idx % 50 == 0 {
+                println!("\nGuardando checkpoint en batch {}...", batch_idx);
+                for i in 0..num_models { varmaps[i].save(&format!("tinystory2v_parallel_{}.safetensors", i+1))?; }
+                final_vm.save(final_model_path)?;
+                
+                // Generar con ensemble hilos
+                let mut rng = rand::rng();
+                let ridx = rng.random_range(0..tokens.len() - 10);
+                let seed = tokenizer.decode(&tokens[ridx..ridx+5]);
+                println!("  Seed: '{}'", seed);
+                let gen_sample = generate_threaded_text(&models, &final_model, &tokenizer, &seed, 500, &device, &thread_barrier)?;
+                println!("  TinyStory2V: {}\n", gen_sample);
+            }
+        } // Fin loop batch_idx
 
         println!("\nEpoch {} OK ({:.1}s). Guardando...", epoch+1, start_time.elapsed().as_secs_f32());
-        for i in 0..num_models { varmaps[i].save(&format!("cortex_model_{}.safetensors", i+1))?; }
+        for i in 0..num_models { varmaps[i].save(&format!("tinystory2v_parallel_{}.safetensors", i+1))?; }
+        final_vm.save(final_model_path)?;
 
         // Generar con ensemble hilos
         let mut rng = rand::rng();
         let ridx = rng.random_range(0..tokens.len() - 10);
         let seed = tokenizer.decode(&tokens[ridx..ridx+5]);
         println!("  Seed: '{}'", seed);
-        let gen_sample = generate_threaded_text(&models, &tokenizer, &seed, 100, &device, &thread_barrier)?;
-            println!("  Ensemble Thread: {}\n", gen_sample);
-        }
-    }
+        let gen_sample = generate_threaded_text(&models, &final_model, &tokenizer, &seed, 300, &device, &thread_barrier)?;
+        println!("  TinyStory2V: {}\n", gen_sample);
+    } // Fin loop epoch
+} // Fin if train_mode
 
     // Barrera para inferencia (si no se creó en el entrenamiento)
     let thread_barrier = Arc::new(Barrier::new(num_models));
 
-    println!("\n--- Modo Interactivo (Cortex Thread Ensemble) ---");
+    println!("\n--- Modo Interactivo (TinyStory2V) ---");
     println!("Comandos:");
     println!("  - Escribe 'len N' para cambiar la longitud de generación");
     println!("  - Escribe 'exit' para salir");
@@ -515,8 +637,8 @@ fn main() -> Result<()> {
             continue;
         }
 
-        let gen_interactive = generate_threaded_text(&models, &tokenizer, input, gen_length, &device, &thread_barrier)?;
-        println!("Cortex (Threaded): {}\n", gen_interactive);
+        let gen_interactive = generate_threaded_text(&models, &final_model, &tokenizer, input, gen_length, &device, &thread_barrier)?;
+        println!("TinyStory2V (3 Parallel + 2 Block Final): {}\n", gen_interactive);
     }
 
     Ok(())
