@@ -352,10 +352,10 @@ fn main() -> Result<()> {
         drop(data);
 
         let mut optim_slstm = AdamW::new(slstm_params, ParamsAdamW { lr: 8e-3, ..Default::default() })?;
-        let mut optim_mlstm = AdamW::new(mlstm_params, ParamsAdamW { lr: 5e-4, ..Default::default() })?;
-        let mut optim_mingru = AdamW::new(mingru_params, ParamsAdamW { lr: 1e-4, ..Default::default() })?;
-        let mut optim_minlstm = AdamW::new(minlstm_params, ParamsAdamW { lr: 5e-4, ..Default::default() })?;
-        let mut optim_other = AdamW::new(other_params, ParamsAdamW { lr: 2e-4, ..Default::default() })?;
+        let mut optim_mlstm = AdamW::new(mlstm_params, ParamsAdamW { lr: 1e-3, ..Default::default() })?; // Subido de 3e-4
+        let mut optim_mingru = AdamW::new(mingru_params, ParamsAdamW { lr: 1e-3, ..Default::default() })?; // Subido de 6e-4
+        let mut optim_minlstm = AdamW::new(minlstm_params, ParamsAdamW { lr: 1e-3, ..Default::default() })?; // Subido de 3e-4
+        let mut optim_other = AdamW::new(other_params, ParamsAdamW { lr: 1e-3, ..Default::default() })?; // Subido de 2e-4
 
         println!("Iniciando entrenamiento...\n");
         model.print_architecture();
@@ -414,7 +414,8 @@ fn main() -> Result<()> {
 
                 if batch_pos % 1 == 0 || batch_pos == num_batches - 1 {
                     let elapsed = epoch_start.elapsed().as_secs_f32();
-                    print!("\r  -> Batch [{}/{}] Loss: {:.4} (avg {:.4}) Acc: {:.2}% ({:.1}s)", 
+                    // Usamos solo \r y espacios al final para mayor compatibilidad en Windows
+                    print!("\r  -> Batch [{}/{}] Loss: {:.4} (avg {:.4}) Acc: {:.2}% ({:.1}s)    ", 
                         batch_pos + 1, num_batches, batch_loss, total_loss / (num_losses as f32),
                         100.0 * correct as f32 / total as f32, elapsed);
                     io::stdout().flush().unwrap();

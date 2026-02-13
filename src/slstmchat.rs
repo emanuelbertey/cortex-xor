@@ -320,7 +320,7 @@ fn main() -> Result<()> {
 
     let text_file = &args[1];
     let tokenizer_path = "tlitte.json";
-    let model_path = "lilitchat_model.safetensors";
+    let model_path = "mlstmmodel.safetensors";
 
     let target_vocab_size = 1024;
 
@@ -390,7 +390,7 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
         .with_vocab_size(vocab_size)
         .with_dropout(dropout)
         .with_num_heads(num_heads)
-        .with_lstm_type(LstmType::MinGRU) 
+        .with_lstm_type(LstmType::MLSTM) 
         .with_use_projection(true);   
 
     let model_file_path = Path::new(model_path);
@@ -483,7 +483,7 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
         // sLSTM suele tolerar LRs más altas, mLSTM requiere más cuidado.
         // MinGRU y MinLSTM necesitan LRs extremadamente bajos por estabilidad numérica
         let mut optim_slstm = AdamW::new(slstm_params, ParamsAdamW { lr: 8e-3, ..Default::default() })?;
-        let mut optim_mlstm = AdamW::new(mlstm_params, ParamsAdamW { lr: 8e-5, ..Default::default() })?;
+        let mut optim_mlstm = AdamW::new(mlstm_params, ParamsAdamW { lr: 1e-3, ..Default::default() })?;
         let mut optim_mingru = AdamW::new(mingru_params, ParamsAdamW { lr: 1e-4, ..Default::default() })?;
         let mut optim_minlstm = AdamW::new(minlstm_params, ParamsAdamW { lr: 5e-6, ..Default::default() })?;
         let mut optim_other = AdamW::new(other_params, ParamsAdamW { lr: 2e-4, ..Default::default() })?;

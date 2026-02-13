@@ -199,7 +199,7 @@ impl SLstm {
                     Tensor::zeros((batch_size, self.d_hidden), DType::F32, device)?,
                     Tensor::zeros((batch_size, self.d_hidden), DType::F32, device)?,
                     // m_0 configurable (permite ajuste fino)
-                    (Tensor::ones((batch_size, self.d_hidden), DType::F32, device)? * self.stabilizer_init)?,
+                    (Tensor::ones((batch_size, self.d_hidden), DType::F32, device)? * (self.stabilizer_init as f64))?,
                 ))
             })
             .collect()

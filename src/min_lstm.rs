@@ -24,10 +24,10 @@ impl MinLstmConfig {
             heads: 1,
             // Valores por defecto sugeridos
             weight_stdev: 0.02,
-            forget_bias: 1.0,
+            forget_bias: 6.2,
             epsilon: 1e-6,
             log_clamp: 1e-4,
-            scan_clamp: 8.0,
+            scan_clamp: 5.5,
         }
     }
 
@@ -57,11 +57,12 @@ impl MinLstmConfig {
         for i in 0..d_inner {
             b_v[i + d_inner] = self.forget_bias; 
         }
-        let b = vb.get_with_hints(d_inner * 3, "bias", Init::Const(0.0))?
-                  .broadcast_add(&Tensor::from_vec(b_v, (d_inner * 3,), w.device())?)?;
+        let b = vb.get_with_hints(d_inner * 3, "bias", Init::Const(0.0))?;
+        let bias_offset = Tensor::from_vec(b_v, (1, 1, d_inner * 3), w.device())?;
 
         Ok(MinLstm { 
             to_hfg: Linear::new(w, Some(b)), 
+            bias_offset,
             dim_inner: d_inner,
             config: self.clone(),
         })
@@ -71,6 +72,7 @@ impl MinLstmConfig {
 #[derive(Debug)]
 pub struct MinLstm {
     to_hfg: Linear,
+    bias_offset: Tensor,
     dim_inner: usize,
     config: MinLstmConfig,
 }
@@ -81,7 +83,7 @@ impl MinLstm {
         let dev = x.device();
         let dtype = x.dtype();
 
-        let hfg = self.to_hfg.forward(x)?; 
+        let hfg = self.to_hfg.forward(x)?.broadcast_add(&self.bias_offset)?; 
         
         let scale = (self.dim_inner as f64).sqrt();
         let hfg_scaled = (&hfg / scale)?;

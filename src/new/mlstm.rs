@@ -105,8 +105,8 @@ impl MLstmconfig {
             expansion_factor: 2,
             dropout: 0.0,
             weight_stdev: 0.02,
-            forget_bias: 3.0,
-            input_gate_bias: 3.0,
+            forget_bias: 1.0,
+            input_gate_bias: 0.0,
             output_gate_bias: 0.0,
             epsilon: 1e-6,
             log_clamp: 1e-8,
@@ -114,7 +114,7 @@ impl MLstmconfig {
             norm_clamp_min: 1e-6,
             norm_clamp_max: 1e10,
             use_separate_bias: true,
-            exp_gate_scale: 1.5,
+            exp_gate_scale: 1.0,
         }
     }
 
@@ -306,7 +306,6 @@ impl MLstmcell {
         vb: VarBuilder,
     ) -> Result<Self> {
         let d_inner = hidden_size * expansion_factor;
-        let total_gates = 2 * num_heads + d_inner; // i:H, f:H, o:D_inner
         
         let weight_init = candle_nn::init::Init::Randn {
             mean: 0.0,
@@ -314,35 +313,42 @@ impl MLstmcell {
         };
         
         let weight_ih = vb.get_with_hints(
-            (total_gates, input_size), 
+            (3 * d_inner, input_size), 
             "weight_ih", 
             weight_init.clone(),
         )?;
         
         let weight_hh = vb.get_with_hints(
-            (total_gates, hidden_size), 
+            (3 * d_inner, hidden_size), 
             "weight_hh", 
             weight_init,
         )?;
 
-        let bias = vb.get_with_hints(total_gates, "bias", candle_nn::init::Init::Const(0.0))?;
+        let bias = if config.use_separate_bias {
+            let mut bias_vals = vec![0.0f32; 3 * d_inner];
+            // Input gate bias (exponential)
+            for i in (0 * d_inner)..(1 * d_inner) {
+                bias_vals[i] = config.input_gate_bias;
+            }
+            // Forget gate bias (sigmoid) 
+            for i in (1 * d_inner)..(2 * d_inner) {
+                bias_vals[i] = config.forget_bias;
+            }
+            // Output gate bias (sigmoid)
+            for i in (2 * d_inner)..(3 * d_inner) {
+                bias_vals[i] = config.output_gate_bias;
+            }
+            Tensor::from_vec(bias_vals, (3 * d_inner,), vb.device())?
+        } else {
+            vb.get_with_hints(3 * d_inner, "bias", candle_nn::init::Init::Const(0.0))?
+        };
 
-        let mut b_offset_vals = vec![0.0f32; total_gates];
-        if config.use_separate_bias {
-            // Input gate bias (scalar per head)
-            for i in 0..num_heads {
-                b_offset_vals[i] = config.input_gate_bias;
-            }
-            // Forget gate bias (scalar per head) 
-            for i in num_heads..(2 * num_heads) {
-                b_offset_vals[i] = config.forget_bias + 0.5; // Con offset de estabilidad
-            }
-            // Output gate bias (vector per head)
-            for i in (2 * num_heads)..total_gates {
-                b_offset_vals[i] = config.output_gate_bias;
-            }
+        let device = vb.device();
+        let mut b_offset_vals = vec![0.0f32; 3 * d_inner];
+        for i in d_inner..(2 * d_inner) {
+            b_offset_vals[i] = 0.5;
         }
-        let bias_offset = Tensor::from_vec(b_offset_vals, (1, 1, total_gates), vb.device())?;
+        let bias_offset = Tensor::from_vec(b_offset_vals, (3 * d_inner,), device)?;
 
         let head_dim = d_inner / num_heads;
 
@@ -402,35 +408,45 @@ impl MLstmcell {
             .contiguous()?;
 
         let scale = (head_dim as f64).sqrt();
-        let k = (k / scale)?; // SOLO k se escala, NO q siguiendo el paper original
+        let q = (q / scale)?;
+        let k = (k / scale)?;
 
         // 2. Parallel Gates
         let (batch_size, seq_len, _d_in) = input_seq.dims3()?;
         let input_flat = input_seq.reshape((batch_size * seq_len, self.input_size))?;
         
         let weight_ih_t = self.weight_ih.t()?.contiguous()?;
-        let total_gates = 2 * self.num_heads + d_inner;
         let gates_flat = input_flat.matmul(&weight_ih_t)?;
-        let gates = gates_flat.reshape((batch_size, seq_len, total_gates))?
-            .broadcast_add(&self.bias.reshape((1, 1, total_gates))?)?
-            .broadcast_add(&self.bias_offset)?;
+        let gates = gates_flat.reshape((batch_size, seq_len, 3 * d_inner))?
+            .broadcast_add(&self.bias.reshape((1, 1, 3 * d_inner))?)?
+            .broadcast_add(&self.bias_offset.reshape((1, 1, 3 * d_inner))?)?;
         
-        // Separamos i (H), f (H), o (D_inner)
-        let i_pre = gates.narrow(2, 0, self.num_heads)?;
-        let f_pre = gates.narrow(2, self.num_heads, self.num_heads)?;
-        let o_pre = gates.narrow(2, 2 * self.num_heads, d_inner)?;
+        let chunks = gates.chunk(3, 2)?; // Chunk on last dim (dim 2)
         
-        // i y f a forma [B, H, S, 1]
-        let i_scaled = (i_pre.permute((0, 2, 1))?.unsqueeze(3)? / self.config.exp_gate_scale)?
-            .clamp(-self.config.exp_clamp, self.config.exp_clamp)?;
+        let i_raw = chunks[0].clone()
+            .reshape((batch_size, seq_len, self.num_heads, head_dim))?
+            .permute((0, 2, 1, 3))?;
+
+        let f_raw = chunks[1].clone()
+            .reshape((batch_size, seq_len, self.num_heads, head_dim))?
+            .permute((0, 2, 1, 3))?;
+        
+        let o_pre = chunks[2].clone();
+        
+        // Apply exponential gate scaling and clamping
+        let i_scaled = (i_raw / self.config.exp_gate_scale)?.clamp(-self.config.exp_clamp, self.config.exp_clamp)?;
         let i_gate = i_scaled.exp()?;
         
-        let f_gate = ops::sigmoid(&f_pre.permute((0, 2, 1))?.unsqueeze(3)?)?;
-        let o_gate = ops::sigmoid(&o_pre)?; // [B, S, D_inner]
+        let f_gate = ops::sigmoid(&f_raw)?;
+        let o_gate = ops::sigmoid(&o_pre)?; // [B, S, D_hidden]
 
-        // Logs para estabilidad (ya son [B, H, S, 1])
-        let i_log_m = i_gate.clamp(self.config.log_clamp as f32, f32::INFINITY)?.log()?;
-        let f_log_m = f_gate.clamp(self.config.log_clamp as f32, 1.0)?.log()?;
+        // Logs for stability
+        let i_log = i_gate.clamp(self.config.log_clamp as f32, f32::INFINITY)?.log()?;
+        let f_log = f_gate.clamp(self.config.log_clamp as f32, 1.0)?.log()?;
+        
+        // Mean over head_dim
+        let i_log_m = i_log.mean(3)?.unsqueeze(3)?; // [B, H, S, 1]
+        let f_log_m = f_log.mean(3)?.unsqueeze(3)?; // [B, H, S, 1]
 
         // 3. Dual Form (Parallel Kernel)
         // Create causal mask
@@ -523,7 +539,19 @@ impl MLstmcell {
         let v_weighted_t = v_weighted.permute((0, 1, 3, 2))?.contiguous()?; // [B, H, D, S] 
         let final_cell_update = v_weighted_t.matmul(&k.contiguous()?)?; // [B, H, D, D] 
 
-        let final_cell = (final_cell_initial + final_cell_update)?; 
+        let mut final_cell = (final_cell_initial + final_cell_update)?; 
+
+        // Soft-normalización dinámica de la matriz de memoria
+        let abs_cell = final_cell.abs()?;
+        let c_max_cols = abs_cell.max(3)?;
+        let c_max_rows = c_max_cols.max(2)?;
+        
+        let ten = Tensor::new(10.0f32, device)?;
+        let denom = c_max_rows.broadcast_add(&ten)?; 
+        let scale_factor = ten.broadcast_div(&denom)?;
+        
+        let scale_factor = scale_factor.unsqueeze(2)?.unsqueeze(3)?;
+        final_cell = final_cell.broadcast_mul(&scale_factor)?;
  
         let final_hidden = h_seq.narrow(1, last_idx, 1)?.reshape((batch_size, self.hidden_size))?; 
  
