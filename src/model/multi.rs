@@ -1,11 +1,8 @@
 #![recursion_limit = "256"]
 
 /*!
-Text Generation with xLSTM using Character-Level Tokenization
-
-This example demonstrates how to use xLSTM for text generation
-using a simple character-level tokenizer that can be saved/loaded as JSON.
-
+Text Generation with xLSTM using 2 mLSTM and 2 MinLSTM Stacked Blocks.
+This example demonstrates a mixed architecture for text generation.
 */
 
 use candle_core::{Device, Tensor, DType};
@@ -23,6 +20,7 @@ use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
 
 use xlstm::{LstmType, XLstm, XLstmconfig, BlockType};
 use rand::Rng;
+use rand::seq::SliceRandom;
 
 /// Tokenizador profesional usando la librería 'tokenizers' de Hugging Face
 pub struct Tokenizer {
@@ -111,7 +109,7 @@ fn create_batch(
     start_idx: usize,
     batch_size: usize,
     seq_length: usize,
-    stride: usize, // Añadido stride explícitamente si se usa dentro
+    stride: usize,
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
     let mut x_indices = Vec::with_capacity(batch_size * seq_length);
@@ -120,13 +118,10 @@ fn create_batch(
     for i in 0..batch_size {
         let current_start = start_idx + (i * stride); 
         for j in 0..seq_length {
-            // Check bounds just in case, though caller handles it
             if current_start + j + 1 < tokens.len() {
                 x_indices.push(tokens[current_start + j] as u32);
                 y_indices.push(tokens[current_start + j + 1] as u32);
             } else {
-                // Padding or error? Caller logic seems to avoid this.
-                // Assuming valid range.
                 x_indices.push(0); 
                 y_indices.push(0);
             }
@@ -139,90 +134,19 @@ fn create_batch(
     Ok((x, y))
 }
 
-/*
-/// Selecciona un token usando muestreo estocástico con Top-K y temperatura
-fn sample_from_logits(logits: &Tensor, temperature: f32) -> Result<usize> {
-    // logits: [1, vocab_size]
-    let logits = logits.squeeze(0)?;
-    let vocab_size = logits.dim(0)?;
-    
-    // To Vec for manual sampling (simpler than tensor operations for top-k sampling for now)
-    let logits_vec = logits.to_vec1::<f32>()?;
-    
-    let mut probs_vec: Vec<(usize, f32)> = logits_vec.iter()
-        .enumerate()
-        .map(|(i, &x)| (i, x))
-        .collect();
-
-    // Softmax is applied later in sampling logic or here?
-    // The original code applied softmax first, then top-k on probs.
-    // Let's replicate logic: Softmax then Top-K.
-    
-    // We can do softmax on tensor first
-    let probs = softmax(&logits, 0)?;
-    let probs_vec_tensor = probs.to_vec1::<f32>()?;
-    let mut probs_indexed: Vec<(usize, f32)> = probs_vec_tensor.into_iter().enumerate().collect();
-
-
-    // --- TOP-K ---
-    // Ordenar de mayor a menor probabilidad
-    probs_indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    
-    // Solo nos quedamos con los 5 o 10 mejores candidatos
-    let k = 5; 
-    let top_k_probs = &probs_indexed[..k.min(vocab_size)];
-    
-    // Extraer solo los pesos para el muestreo
-    let indices: Vec<usize> = top_k_probs.iter().map(|(i, _)| *i).collect();
-    let mut weights: Vec<f32> = top_k_probs.iter().map(|(_, p)| *p).collect();
-    // --------------------
-
-    // Si la temperatura es muy baja, actuar de forma determinista (Greedy)
-    if temperature <= 1e-6 {
-        return Ok(indices[0]);
-    }
-
-    // Aplicar temperatura sobre el Top-K
-    for p in weights.iter_mut() {
-        // p is probability. log(p)/temp -> exp
-         *p = (p.max(1e-10).ln() / temperature).exp();
-    }
-
-    let sum: f32 = weights.iter().sum();
-    let mut rng = rand::rng(); 
-    let sample: f32 = rng.random::<f32>() * sum;
-    let mut cumulative = 0.0;
-
-    for (i, &p) in weights.iter().enumerate() {
-        cumulative += p;
-        if sample <= cumulative {
-            return Ok(indices[i]);
-        }
-    }
-
-    Ok(indices[0])
-}
-    */
 fn sample_from_logits(logits: &Tensor, temperature: f32) -> Result<usize> {
     let logits = logits.squeeze(0)?;
     let vocab_size = logits.dim(0)?;
-    
-    // 1. ESCALADO POR TEMPERATURA (Sobre los logits originales)
-    // Esto hace que la distribución sea más plana (temp > 1) o más picuda (temp < 1)
     let scaled_logits = (&logits / (temperature as f64))?;
-    
-    // 2. SOFTMAX para obtener probabilidades reales
     let probs = candle_nn::ops::softmax(&scaled_logits, 0)?;
     let probs_vec = probs.to_vec1::<f32>()?;
     
-    // 3. TOP-K (Tu lógica de filtrado está perfecta)
     let mut probs_indexed: Vec<(usize, f32)> = probs_vec.into_iter().enumerate().collect();
     probs_indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     
-    let k = 10; // Un k de 10 suele dar más variedad que 5
+    let k = 10;
     let top_k_probs = &probs_indexed[..k.min(vocab_size)];
     
-    // 4. MUESTREO (Multinomial)
     let indices: Vec<usize> = top_k_probs.iter().map(|(i, _)| *i).collect();
     let weights: Vec<f32> = top_k_probs.iter().map(|(_, p)| *p).collect();
     
@@ -240,8 +164,6 @@ fn sample_from_logits(logits: &Tensor, temperature: f32) -> Result<usize> {
     Ok(indices[0])
 }
 
-
-/// Genera texto de forma recurrente manteniendo el estado interno del modelo
 fn generate_text(
     model: &XLstm,
     tokenizer: &Tokenizer,
@@ -267,35 +189,18 @@ fn generate_text(
         };
 
         let seq_len = tokens_to_process.len();
-        
-        // Ensure u32 for indices
         let indices_vec: Vec<u32> = tokens_to_process.iter().map(|&t| t as u32).collect();
-        // Input: [1, seq_len] indices
-        let input = Tensor::from_vec(
-            indices_vec, 
-            (1, seq_len), 
-            device
-        )?;
+        let input = Tensor::from_vec(indices_vec, (1, seq_len), device)?;
 
         let (output, next_state) = model.forward(&input, current_state)?;
         current_state = Some(next_state.into_iter().map(|s| s.map(|state| state.detach())).collect());
-        //current_state = Some(next_state);
 
-        let (_b, _l, _v) = output.dims3()?;
-        // Extract last step logits
-       
-        let last_logits = output.narrow(1, seq_len - 1, 1)?
-        .squeeze(1)?
-        .detach();
-        //let last_logits = output.narrow(1, seq_len - 1, 1)?
-           // .squeeze(1)?; // [1, vocab_size]
-
+        let last_logits = output.narrow(1, seq_len - 1, 1)?.squeeze(1)?.detach();
         let next_token = sample_from_logits(&last_logits, 0.8)?;
 
         current_tokens.push(next_token);
         if let Some(t) = tokenizer.id_to_token(next_token) {
             let mut clean_token = t.clone();
-            // Reemplazo de caracteres especiales de BPE si es necesario
             if clean_token.contains('Ċ') || clean_token.contains('Ġ') {
                clean_token = clean_token.replace("Ċ", "\n").replace("Ġ", " ");
             }
@@ -307,20 +212,19 @@ fn generate_text(
 }
 
 fn main() -> Result<()> {
-    println!("xLSTM (mLSTM) Text Generation con Tokenizador (Candle)");
-    println!("====================================================\n");
+    println!("xLSTM Text Generation (2 mLSTM + 2 MinLSTM) Stacked");
+    println!("==============================================\n");
 
     let args: Vec<String> = std::env::args().collect();
     
     if args.len() < 2 {
-        eprintln!("Uso: cargo run --bin mlstmchat -- <archivo.txt>");
-        eprintln!("Ejemplo: cargo run --bin mlstmchat -- input.txt");
+        eprintln!("Uso: cargo run --bin mlstm_minlstm_chat -- <archivo.txt>");
         std::process::exit(1);
     }
 
     let text_file = &args[1];
-    let tokenizer_path = "tokenizer_mlstm.json";
-    let model_path = "xlstm_chat_model_mlstm.safetensors";
+    let tokenizer_path = "tokenizer_baseline.json";
+    let model_path = "paper_xlstm_model.safetensors";
 
     let target_vocab_size = 1024;
 
@@ -335,28 +239,6 @@ fn main() -> Result<()> {
         tokenizer
     };
 
-println!("\n--- VERIFICACIÓN DE IDENTIDAD DE TOKENS ---");
-let texto_verificacion = " \n"; // Un espacio y un salto de línea
-let ids = tokenizer.encode(texto_verificacion);
-
-for id in ids {
-    let contenido = tokenizer.decode(&[id]);
-    // Esto te dirá exactamente qué ID tiene el espacio y cuál el salto
-    if contenido.contains(' ') {
-        println!("ID: {:<5} | Representa: [ESPACIO SEGURO]", id);
-    } else if contenido.contains('\n') {
-        println!("ID: {:<5} | Representa: [SALTO DE LINEA SEGURO]", id);
-    } else {
-        println!("ID: {:<5} | Representa: '{}'", id, contenido);
-    }
-}
-println!("-------------------------------------------\n");
-
-let prueba = tokenizer.encode(" ");
-println!("DEBUG ESPACIO: {:?}", prueba);
-
-let prueba_salto = tokenizer.encode("\n");
-println!("DEBUG SALTO: {:?}", prueba_salto);
     println!("Tamaño del vocabulario: {}\n", tokenizer.vocab_size());
 
     println!("Cargando texto de entrenamiento...");
@@ -367,18 +249,18 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
     let vocab_size = tokenizer.vocab_size();
     let hidden_size = 256; 
     let num_layers = 1;
-    let num_blocks = 2;
+    let num_blocks = 5; // 2 mLSTM + 2 MinLSTM
     let output_size = vocab_size; 
-    let  mut dropout = 0.0;
+    let dropout = 0.05;
 
     let seq_length = 128; 
-    let batch_size = 16; 
+    let batch_size = 12; 
     let stride = 128;     
     let num_epochs = 50;
     let num_heads = 4;
 
     println!("Configuración del modelo:");
-    println!("  Bloques: {}", num_blocks);
+    println!("  Bloques: {} (2 mLSTM, 2 MinLSTM)", num_blocks);
     println!("  Hidden size: {}", hidden_size);
     println!("  Seq length: {}", seq_length);
     println!("  Batch size: {}", batch_size);
@@ -386,11 +268,20 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
 
     let device = Device::Cpu;
 
-     let config = XLstmconfig::new(hidden_size, hidden_size, num_layers, num_blocks, output_size)
+    // Custom stacking: Interleaved mLSTM and MinLSTM
+    let custom_blocks = vec![
+        BlockType::SLSTM,
+        BlockType::MLSTM,
+        BlockType::SLSTM,
+        BlockType::MLSTM,
+        BlockType::SLSTM,
+    ];
+
+    let config = XLstmconfig::new(hidden_size, hidden_size, num_layers, num_blocks, output_size)
         .with_vocab_size(vocab_size)
         .with_dropout(dropout)
         .with_num_heads(num_heads)
-        .with_lstm_type(LstmType::SLSTM)
+        .with_lstm_type(LstmType::Custom(custom_blocks)) 
         .with_use_projection(true);   
 
     let model_file_path = Path::new(model_path);
@@ -404,15 +295,12 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
         io::stdin().read_line(&mut input)?;
         if input.trim().to_lowercase() == "s" {
             continuar_entrenamiento = true;
-         }/* else {
-            continuar_entrenamiento = false;
-         }*/
+        }
     }
 
     let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    //let model = config.init(vb)?;
-    let mut model = config.init(vb)?;
+    let model = config.init(vb)?;
 
     if existe_modelo {
          if !continuar_entrenamiento {
@@ -427,33 +315,19 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
          println!("No se encontró modelo guardado. Iniciando entrenamiento desde cero...\n");
     }
     
-    // Logic from main.rs training loop, adapted
     if !existe_modelo || continuar_entrenamiento {
-
-        if !tokens.is_empty() {
-             let first_token_idx = tokens[0];
-             let first_token_str = tokenizer.id_to_token(first_token_idx).unwrap_or("?".to_string());
-             println!("--- INSPECCIÓN DE EMBEDDING ---");
-             println!("  Token Index: {}", first_token_idx);
-             println!("  Token Str: '{}'", first_token_str);
-             println!("-----------------------------\n");
-        }
-
         let num_sequences = tokens.len().saturating_sub(seq_length);
         let num_actual_sequences = (num_sequences + stride - 1) / stride;
 
-        // Group parameters for optimizers (as in main.rs)
-        let parsed_block_types = match config.lstm_type {
-            LstmType::SLSTM => vec![BlockType::SLSTM; num_blocks],
-            LstmType::MLSTM => vec![BlockType::MLSTM; num_blocks],
-            LstmType::Alternate => (0..num_blocks)
-                .map(|i| if i % 2 == 0 { BlockType::SLSTM } else { BlockType::MLSTM })
-                .collect(),
-            LstmType::Custom(ref types) => types.clone(),
+        let parsed_block_types = match &config.lstm_type {
+            LstmType::Custom(types) => types.clone(),
+            _ => unreachable!(),
         };
 
         let mut slstm_params = Vec::new();
         let mut mlstm_params = Vec::new();
+        let mut mingru_params = Vec::new();
+        let mut minlstm_params = Vec::new();
         let mut other_params = Vec::new();
 
         let data = varmap.data().lock().unwrap();
@@ -467,6 +341,8 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
                                  match parsed_block_types[idx] {
                                      BlockType::SLSTM => slstm_params.push(var.clone()),
                                      BlockType::MLSTM => mlstm_params.push(var.clone()),
+                                     BlockType::MinGRU => mingru_params.push(var.clone()),
+                                     BlockType::MinLSTM => minlstm_params.push(var.clone()),
                                  }
                              } else { other_params.push(var.clone()); }
                          } else { other_params.push(var.clone()); }
@@ -474,44 +350,36 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
                 } else { other_params.push(var.clone()); }
             } else { other_params.push(var.clone()); }
         }
-        drop(data); // release lock before training
+        drop(data);
 
-        // Tasas de aprendizaje recomendadas para xLSTM: 
-        // sLSTM suele tolerar LRs más altas, mLSTM requiere más cuidado.
-        let mut optim_slstm = AdamW::new(slstm_params, ParamsAdamW { lr: 2e-4, ..Default::default() })?;
-       // let mut optim_mlstm = AdamW::new(mlstm_params, ParamsAdamW { lr: 8e-4, ..Default::default() })?;
-        let mut optim_other = AdamW::new(other_params, ParamsAdamW { lr: 2e-4, ..Default::default() })?;
-
-
-        model.print_architecture();
-        let lr_max = 4e-4;
-        let lr_min = 2.5e-4;
-        let mut aumentando = false; // Control de dirección
-        let step_factor = 0.985;      // Qué tan rápido cambia
-        let mut current_lr = 6.5e-4;
-        let mut optim_mlstm = AdamW::new(mlstm_params.clone(), ParamsAdamW { 
-            lr: current_lr, 
-            ..Default::default() 
-        })?;
-
-
+        let mut optim_slstm = AdamW::new(slstm_params, ParamsAdamW { lr: 4e-3, ..Default::default() })?;
+        let mut optim_mlstm = AdamW::new(mlstm_params, ParamsAdamW { lr: 1e-3, ..Default::default() })?; // Subido de 3e-4
+        let mut optim_mingru = AdamW::new(mingru_params, ParamsAdamW { lr: 1e-3, ..Default::default() })?; // Subido de 6e-4
+        let mut optim_minlstm = AdamW::new(minlstm_params, ParamsAdamW { lr: 1e-3, ..Default::default() })?; // Subido de 3e-4
+        let mut optim_other = AdamW::new( other_params,ParamsAdamW {lr: 1e-3,
+        weight_decay: 0.01, beta1: 0.9,   beta2: 0.999,eps: 1e-8,},)?;
+        
         println!("Iniciando entrenamiento...\n");
-
+        model.print_architecture();
         let num_batches = num_actual_sequences.div_ceil(batch_size);
-        dropout = 0.008;
+
         for epoch in 0..num_epochs {
             let mut total_loss = 0.0f32;
             let mut num_losses = 0;
             let mut correct = 0;
             let mut total = 0;
-            let mut current_state = None;
-            for batch_idx in 0..num_batches {
+            let mut batch_order: Vec<usize> = (0..num_batches).collect();
+            {
+                let mut rng = rand::rng();
+                batch_order.shuffle(&mut rng);
+            }
+
+            for (batch_pos, batch_idx) in batch_order.into_iter().enumerate() {
                 let epoch_start = Instant::now();
                 let current_batch_start_seq = batch_idx * batch_size;
                 let current_batch_size = (batch_size).min(num_actual_sequences - current_batch_start_seq);
 
-                if current_batch_size == 0 { break; }
-                if current_batch_size < batch_size { break; } // Skip incomplete
+                if current_batch_size < batch_size { continue; }
 
                 let (input_batch, target_batch) = create_batch(
                     &tokens,
@@ -522,31 +390,17 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
                     &device,
                 )?;
 
-                if batch_idx == 0 {
-                // Hacemos un forward silencioso para llenar las matrices del mLSTM
-                let (_, warm_state) = model.forward(&input_batch, None)?;
-                current_state = Some(warm_state.into_iter().map(|s| s.map(|state| state.detach())).collect());
-                println!("> Estado inicializado con éxito en el Batch 0");
-              }
-               
-             
-              //  let (logits, _) = model.forward(&input_batch,  None)?;
-               let (logits, next_state) = model.forward(&input_batch, current_state)?;
-                current_state = Some(next_state.into_iter().map(|s| s.map(|state| state.detach())).collect());
+                let (logits, _) = model.forward(&input_batch, None)?;
 
-
-                // Optimization
                 let logits_flat = logits.reshape((current_batch_size * seq_length, vocab_size))?;
-                let target_flat = target_batch.reshape((current_batch_size * seq_length,))?; // IDs [N]
+                let target_flat = target_batch.reshape((current_batch_size * seq_length,))?;
 
-                // Cross Entropy
-                // Candle cross_entropy expects logits and targets (u32 indices)
                 let loss = candle_nn::loss::cross_entropy(&logits_flat, &target_flat)?;
-                
-                total_loss += loss.to_scalar::<f32>()?;
+                let batch_loss = loss.to_scalar::<f32>()?;
+
+                total_loss += batch_loss;
                 num_losses += 1;
 
-                // Accuracy
                 let preds = logits_flat.argmax(1)?;
                 let correct_count = preds.eq(&target_flat)?.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()? as usize;
                 correct += correct_count;
@@ -554,53 +408,20 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
 
                 let grads = loss.backward()?;
 
-                // Ahora los optimizadores usarán los gradientes
                 optim_slstm.step(&grads)?;
                 optim_mlstm.step(&grads)?;
+                optim_mingru.step(&grads)?;
+                optim_minlstm.step(&grads)?;
                 optim_other.step(&grads)?;
 
-                if batch_idx % 1 == 0 || batch_idx == num_batches - 1 {
+                if batch_pos % 1 == 0 || batch_pos == num_batches - 1 {
                     let elapsed = epoch_start.elapsed().as_secs_f32();
-                    print!("\r  -> Batch [{}/{}] Loss: {:.4} Acc: {:.2}% ({:.1}s)", 
-                        batch_idx + 1, num_batches, total_loss / (num_losses as f32),
+                    // Usamos solo \r y espacios al final para mayor compatibilidad en Windows
+                    print!("\r  -> Batch [{}/{}] Loss: {:.4} (avg {:.4}) Acc: {:.2}% ({:.1}s)    ", 
+                        batch_pos + 1, num_batches, batch_loss, total_loss / (num_losses as f32),
                         100.0 * correct as f32 / total as f32, elapsed);
                     io::stdout().flush().unwrap();
-                
                 }
-            
-                 if batch_idx % 5 == 0 && batch_idx > 0 {
-                    let factor = step_factor as f32; //  errores
-
-                    if aumentando {
-
-                        dropout /= factor;           // 1. Actualizamos la variable local
-                        model.dropout = dropout;     // 2. Se la pasamos al model
-                        current_lr /= step_factor; // El LR suele ser f64, está bien
-                        if current_lr >= lr_max {
-                            current_lr = lr_max;
-                            aumentando = false; 
-                        }
-                    } else {
-                            dropout *= factor;           // 1. Actualizamos la variable local 
-                        current_lr *= step_factor; 
-                        if current_lr <= lr_min {
-                            current_lr = lr_min;
-                            aumentando = true; 
-                        }
-                    }
-                    dropout = dropout.clamp(0.001, 0.007);
-                    model.blocks.iter_mut().for_each(|b| b.dropout_prob = dropout);
-            
-                    println!(
-                        "\n[CYCLIC SCHEDULER] LR: {:.2e} | Dropout: {:.4} | Dirección: {}", 
-                        current_lr, 
-                       dropout, //
-                        if aumentando { "Sube ↑" } else { "Baja ↓" }
-                    );
-                } 
-
-                optim_mlstm = AdamW::new(mlstm_params.clone(),ParamsAdamW {lr: current_lr,..Default::default() }  )?;
-                                        
             }
             println!();
 
@@ -609,11 +430,9 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
 
             println!("Epoch [{:3}/{}], Loss: {:.4}, Accuracy: {:.2}%", epoch + 1, num_epochs, avg_loss, accuracy);
 
-            // Save per epoch
             varmap.save(model_path)?;
 
-            // Generate sample
-             if epoch % 1 == 0 {
+            if epoch % 1 == 0 {
                 let mut rng = rand::rng();
                 let start_random = if tokens.len() > 10 {
                     rng.random_range(0..tokens.len() - 6)
@@ -628,20 +447,12 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
             }
         }
         println!("\n¡Entrenamiento completado!");
-    } else {
-        // Just inference mode
     }
 
-    // Modo interactivo - Loop para generar texto
     println!("\n╔════════════════════════════════════════════════════════╗");
     println!("║        MODO INTERACTIVO - GENERACIÓN DE TEXTO         ║");
     println!("╚════════════════════════════════════════════════════════╝\n");
-    println!("Comandos:");
-    println!("  - Escribe un texto semilla y presiona Enter para generar");
-    println!("  - Escribe 'salir' o 'exit' para terminar");
-    println!("  - Escribe 'auto' para generar con semilla automática");
-    println!("  - Escribe 'len N' para cambiar longitud de generación (tokens)\n");
-
+    
     let mut gen_length: usize = 200;
 
     loop {
@@ -657,34 +468,22 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
 
         if input.to_lowercase().starts_with("len") {
             let parts: Vec<&str> = input.split_whitespace().collect();
-            if parts.len() == 1 {
-                println!("Longitud actual de generación: {} tokens\n", gen_length);
-            } else if parts.len() >= 2 {
-                match parts[1].parse::<usize>() {
-                    Ok(n) if n > 0 && n <= 20000 => {
-                        gen_length = n;
-                        println!("Nueva longitud de generación establecida en {} tokens\n", gen_length);
-                    }
-                    Ok(_) => {
-                        println!("Por favor usa un valor entre 1 y 20000.\n");
-                    }
-                    Err(_) => {
-                        println!("Formato inválido. Usa: len 200\n");
-                    }
+            if parts.len() >= 2 {
+                if let Ok(n) = parts[1].parse::<usize>() {
+                    gen_length = n;
+                    println!("Nueva longitud de generación establecida en {} tokens\n", gen_length);
                 }
             }
             continue;
         }
 
-         let seed = if input.eq_ignore_ascii_case("auto") {
-             // We need 'text' but it might not be loaded if we didn't train.
-             // If not trained, we might fail here. But simpler to assume we have text or don't support auto.
-             if tokens.len() > 20 {
-                 let seed_tokens: Vec<usize> = tokens[0..20].to_vec();
-                 tokenizer.decode(&seed_tokens)
-             } else {
-                 "Once upon a time".to_string()
-             }
+        let seed = if input.eq_ignore_ascii_case("auto") {
+            if tokens.len() > 20 {
+                let seed_tokens: Vec<usize> = tokens[0..20].to_vec();
+                tokenizer.decode(&seed_tokens)
+            } else {
+                "Once upon a time".to_string()
+            }
         } else {
             input.to_string()
         };

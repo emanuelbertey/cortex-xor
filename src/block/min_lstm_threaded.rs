@@ -1,7 +1,7 @@
 use candle_core::{Tensor, Result, IndexOp};
 use std::thread;
 use std::sync::Arc;
-use crate::min_lstm::{MinLstm, MinLstmConfig};
+use crate::block::min_lstm::{MinLstm, MinLstmConfig};
 
 pub struct MinLstmThreaded {
     inner: Arc<MinLstm>,
@@ -41,7 +41,8 @@ impl MinLstmThreaded {
             if start_b >= end_b { break; }
 
             let x_chunk = x.narrow(0, start_b, end_b - start_b)?;
-            let model_ref = Arc::clone(&self.inner);
+            // Explicitly annotate type to help inference
+            let model_ref: Arc<MinLstm> = Arc::clone(&self.inner);
             
             handles.push(thread::spawn(move || {
                 model_ref.forward(&x_chunk, None, false)

@@ -245,8 +245,10 @@ impl XLstm {
         if let Some((linear, norm, _dropout)) = &self.input_projection {
             x = linear.forward(&x)?;
             x = norm.forward(&x)?;
-           x = x.gelu()?;
-           // x = dropout.forward(&x, true)?;
+            x = x.gelu()?;
+            if self.dropout > 0.0 {
+                x = _dropout.forward(&x, true)?;
+            }
         }
 
         // Initialize states if not provided
@@ -266,13 +268,22 @@ añade una LayerNorm justo antes de la linear1 en el output_head.
   conforme pasan los bloques,
    y normalizar justo antes del "head" final estabiliza
     mucho las probabilidades de la Softmax.
+     ECHO NO DESASER :)
 */
 
         // Apply output head
         let (linear1, _dropout, linear2) = &self.output_head;
         x = linear1.forward(&x)?;
+         
+        // Apply LayerNorm if present
+      //  if let Some(norm) = output_norm {
+       //     x = norm.forward(&x)?;
+      // } 
+
         x = x.gelu()?;
-      //  x = dropout.forward(&x, true)?;
+        if self.dropout > 0.0 {
+             x = _dropout.forward(&x, true)?;
+        }
         let output = linear2.forward(&x)?;
 
         Ok((output, hidden_states))

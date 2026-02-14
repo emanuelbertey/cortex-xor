@@ -23,6 +23,7 @@ use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
 
 use xlstm::{LstmType, XLstm, XLstmconfig, BlockType};
 use rand::Rng;
+use rand::seq::SliceRandom;
 
 /// Tokenizador profesional usando la librería 'tokenizers' de Hugging Face
 pub struct Tokenizer {
@@ -39,7 +40,7 @@ impl Tokenizer {
         let mut tokenizer = HFTokenizer::new(model);
 
         tokenizer.with_pre_tokenizer(Some(Metaspace::new(
-            '▁',
+            ' ',
             PrependScheme::Always,
             true,
         )));
@@ -118,11 +119,18 @@ fn create_batch(
     let mut y_indices = Vec::with_capacity(batch_size * seq_length);
 
     for i in 0..batch_size {
-        let current_start = start_idx + (i * stride);
+        let current_start = start_idx + (i * stride); 
         for j in 0..seq_length {
-            let idx = current_start + j;
-            x_indices.push(tokens[idx] as u32);
-            y_indices.push(tokens[idx + 1] as u32);
+            // Check bounds just in case, though caller handles it
+            if current_start + j + 1 < tokens.len() {
+                x_indices.push(tokens[current_start + j] as u32);
+                y_indices.push(tokens[current_start + j + 1] as u32);
+            } else {
+                // Padding or error? Caller logic seems to avoid this.
+                // Assuming valid range.
+                x_indices.push(0); 
+                y_indices.push(0);
+            }
         }
     }
 
@@ -196,91 +204,40 @@ fn sample_from_logits(logits: &Tensor, temperature: f32) -> Result<usize> {
     Ok(indices[0])
 }
     */
-fn sample_from_logits(logits: &Tensor, temperature: f32, top_k: usize, top_p: f32, greedy_threshold: f32) -> Result<usize> {
+fn sample_from_logits(logits: &Tensor, temperature: f32) -> Result<usize> {
     let logits = logits.squeeze(0)?;
     let vocab_size = logits.dim(0)?;
+    
+    // 1. ESCALADO POR TEMPERATURA (Sobre los logits originales)
+    // Esto hace que la distribución sea más plana (temp > 1) o más picuda (temp < 1)
     let scaled_logits = (&logits / (temperature as f64))?;
+    
+    // 2. SOFTMAX para obtener probabilidades reales
     let probs = candle_nn::ops::softmax(&scaled_logits, 0)?;
-    let mut probs_indexed: Vec<(usize, f32)> = probs.to_vec1::<f32>()?.into_iter().enumerate().collect();
+    let probs_vec = probs.to_vec1::<f32>()?;
+    
+    // 3. TOP-K (Tu lógica de filtrado está perfecta)
+    let mut probs_indexed: Vec<(usize, f32)> = probs_vec.into_iter().enumerate().collect();
     probs_indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let max_p = probs_indexed.first().map(|(_, p)| *p).unwrap_or(0.0);
-    if max_p >= greedy_threshold {
-        return Ok(probs_indexed[0].0);
-    }
-    let k = top_k.min(vocab_size);
-    let mut cumulative = 0.0f32;
-    let mut filtered: Vec<(usize, f32)> = Vec::with_capacity(k);
-    for (idx, p) in probs_indexed.into_iter().take(k) {
-        if cumulative + p <= top_p || filtered.is_empty() {
-            filtered.push((idx, p));
-            cumulative += p;
-        }
-    }
-    let indices: Vec<usize> = filtered.iter().map(|(i, _)| *i).collect();
-    let weights: Vec<f32> = filtered.iter().map(|(_, p)| *p).collect();
+    
+    let k = 10; // Un k de 10 suele dar más variedad que 5
+    let top_k_probs = &probs_indexed[..k.min(vocab_size)];
+    
+    // 4. MUESTREO (Multinomial)
+    let indices: Vec<usize> = top_k_probs.iter().map(|(i, _)| *i).collect();
+    let weights: Vec<f32> = top_k_probs.iter().map(|(_, p)| *p).collect();
+    
     let sum: f32 = weights.iter().sum();
-    let mut rng = rand::rng();
+    let mut rng = rand::rng(); 
     let mut sample: f32 = rng.random::<f32>() * sum;
-    for (i, &p) in weights.iter().enumerate() {
-        if sample <= p {
-            return Ok(indices[i]);
-        }
-        sample -= p;
-    }
-    Ok(indices[0])
-}
 
-fn sample_with_constraints(logits: &Tensor, tokenizer: &Tokenizer, temperature: f32, top_k: usize, top_p: f32, greedy_threshold: f32) -> Result<usize> {
-    let logits = logits.squeeze(0)?;
-    let vocab_size = logits.dim(0)?;
-    let scaled_logits = (&logits / (temperature as f64))?;
-    let probs = candle_nn::ops::softmax(&scaled_logits, 0)?;
-    let mut probs_indexed: Vec<(usize, f32)> = probs.to_vec1::<f32>()?.into_iter().enumerate().collect();
-    probs_indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let max_p = probs_indexed.first().map(|(_, p)| *p).unwrap_or(0.0);
-    if max_p >= greedy_threshold {
-        return Ok(probs_indexed[0].0);
-    }
-    let k = top_k.min(vocab_size);
-    let mut cumulative = 0.0f32;
-    let mut filtered: Vec<(usize, f32)> = Vec::with_capacity(k);
-    for (idx, p) in probs_indexed.into_iter().take(k) {
-        if cumulative + p <= top_p || filtered.is_empty() {
-            filtered.push((idx, p));
-            cumulative += p;
-        }
-    }
-    // Primera pasada: evitar letras sueltas y tokens que sean solo marcadores
-    for (idx, _) in &filtered {
-        if let Some(tok) = tokenizer.id_to_token(*idx) {
-            let t = tok.trim_start_matches('▁').trim_start_matches('Ġ').replace("Ċ", "");
-            let is_single_alpha = t.chars().count() == 1 && t.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false);
-            let is_marker_only = tok.starts_with('▁') || tok.starts_with('Ġ') || tok.contains('Ċ');
-            if !is_single_alpha && !is_marker_only {
-                return Ok(*idx);
-            }
-        }
-    }
-    // Segunda pasada: permitir espacio ('▁'/'Ġ') si no hubo mejor opción
-    for (idx, _) in &filtered {
-        if let Some(tok) = tokenizer.id_to_token(*idx) {
-            if tok.starts_with('▁') || tok.starts_with('Ġ') {
-                return Ok(*idx);
-            }
-        }
-    }
-    // Fallback probabilístico
-    let indices: Vec<usize> = filtered.iter().map(|(i, _)| *i).collect();
-    let weights: Vec<f32> = filtered.iter().map(|(_, p)| *p).collect();
-    let sum: f32 = weights.iter().sum();
-    let mut rng = rand::rng();
-    let mut sample: f32 = rng.random::<f32>() * sum;
     for (i, &p) in weights.iter().enumerate() {
         if sample <= p {
             return Ok(indices[i]);
         }
         sample -= p;
     }
+
     Ok(indices[0])
 }
 
@@ -293,63 +250,77 @@ fn generate_text(
     length: usize,
     device: &Device,
 ) -> Result<String> {
-    let mut generated_ids: Vec<usize> = tokenizer.encode(seed_text);
+    let mut current_text = seed_text.to_string();
     let seed_tokens = tokenizer.encode(seed_text);
     
     if seed_tokens.is_empty() {
-        return Ok(seed_text.to_string());
+        return Ok(current_text);
     }
 
-    // 1) Procesar la semilla completa para inicializar estado
-    let seed_indices: Vec<u32> = seed_tokens.iter().map(|&t| t as u32).collect();
-    let input_seed = Tensor::from_vec(seed_indices, (1, seed_tokens.len()), device)?;
-    let (seed_output, mut state) = model.forward(&input_seed, None)?;
-    let first_logits = seed_output.narrow(1, seed_tokens.len() - 1, 1)?.squeeze(1)?.detach();
-    let mut last_token = sample_with_constraints(&first_logits, tokenizer, 0.7, 50, 0.9, 0.95)?;
+    let mut current_state = None; 
+    let mut current_tokens = seed_tokens;
 
-    // 2) Loop autoregresivo: pasar solo el nuevo token y usar el estado acumulado
-    for _ in 0..length {
-        let input = Tensor::from_vec(vec![last_token as u32], (1, 1), device)?;
-        let (step_output, next_state) = model.forward(&input, Some(state))?;
-        state = next_state.into_iter().map(|s| s.map(|st| st.detach())).collect();
+    for i in 0..length {
+        let tokens_to_process = if i == 0 {
+            current_tokens.clone()
+        } else {
+            vec![*current_tokens.last().unwrap()]
+        };
 
-        let step_logits = step_output.squeeze(1)?.detach();
-        last_token = sample_with_constraints(&step_logits, tokenizer, 0.7, 50, 0.9, 0.95)?;
-        generated_ids.push(last_token);
-    }
+        let seq_len = tokens_to_process.len();
+        
+        // Ensure u32 for indices
+        let indices_vec: Vec<u32> = tokens_to_process.iter().map(|&t| t as u32).collect();
+        // Input: [1, seq_len] indices
+        let input = Tensor::from_vec(
+            indices_vec, 
+            (1, seq_len), 
+            device
+        )?;
 
-    let mut out = String::new();
-    for &id in &generated_ids {
-        if let Some(mut t) = tokenizer.id_to_token(id) {
-            if t.contains('Ċ') { out.push(' '); continue; }
-            if t.starts_with('▁') || t.starts_with('Ġ') {
-                out.push(' ');
-                t = t.trim_start_matches('▁').trim_start_matches('Ġ').to_string();
+        let (output, next_state) = model.forward(&input, current_state)?;
+        current_state = Some(next_state.into_iter().map(|s| s.map(|state| state.detach())).collect());
+        //current_state = Some(next_state);
+
+        let (_b, _l, _v) = output.dims3()?;
+        // Extract last step logits
+       
+        let last_logits = output.narrow(1, seq_len - 1, 1)?
+        .squeeze(1)?
+        .detach();
+        //let last_logits = output.narrow(1, seq_len - 1, 1)?
+           // .squeeze(1)?; // [1, vocab_size]
+
+        let next_token = sample_from_logits(&last_logits, 0.8)?;
+
+        current_tokens.push(next_token);
+        if let Some(t) = tokenizer.id_to_token(next_token) {
+            let mut clean_token = t.clone();
+            // Reemplazo de caracteres especiales de BPE si es necesario
+            if clean_token.contains('Ċ') || clean_token.contains('Ġ') {
+               clean_token = clean_token.replace("Ċ", "\n").replace("Ġ", " ");
             }
-            t = t.replace("\r\n", "").replace('\r', "");
-            out.push_str(&t);
+            current_text.push_str(&clean_token);
         }
     }
-    out = out.replace('\n', " ");
-    out = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    Ok(out)
-}
 
+    Ok(current_text)
+}
 fn main() -> Result<()> {
-    println!("xLSTM (mLSTM) Text Generation con Tokenizador (Candle)");
-    println!("====================================================\n");
+    println!("xLSTM Text Generation con Tokenizador (Candle)");
+    println!("======================================\n");
 
     let args: Vec<String> = std::env::args().collect();
     
     if args.len() < 2 {
-        eprintln!("Uso: cargo run --bin mlstmchat -- <archivo.txt>");
-        eprintln!("Ejemplo: cargo run --bin mlstmchat -- input.txt");
+        eprintln!("Uso: cargo run --bin xlstmchat -- <archivo.txt>");
+        eprintln!("Ejemplo: cargo run --bin xlstmchat -- input.txt");
         std::process::exit(1);
     }
 
     let text_file = &args[1];
-    let tokenizer_path = "tokenizer_mlstm.json";
-    let model_path = "xlstm_chat_model_mlstm.safetensors";
+    let tokenizer_path = "slstm-test.json";
+    let model_path = "SLSTM_TEST.safetensors";
 
     let target_vocab_size = 1024;
 
@@ -394,11 +365,11 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
     println!("Tokens totales: {}\n", tokens.len());
 
     let vocab_size = tokenizer.vocab_size();
-    let hidden_size = 512; 
+    let hidden_size = 256; 
     let num_layers = 1;
-    let num_blocks = 2;
+    let num_blocks = 1;
     let output_size = vocab_size; 
-    let  mut dropout = 0.0;
+    let dropout = 0.0;
 
     let seq_length = 128; 
     let batch_size = 16; 
@@ -419,7 +390,7 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
         .with_vocab_size(vocab_size)
         .with_dropout(dropout)
         .with_num_heads(num_heads)
-        .with_lstm_type(LstmType::MLSTM)
+        .with_lstm_type(LstmType::SLSTM) 
         .with_use_projection(true);   
 
     let model_file_path = Path::new(model_path);
@@ -433,15 +404,12 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
         io::stdin().read_line(&mut input)?;
         if input.trim().to_lowercase() == "s" {
             continuar_entrenamiento = true;
-         }/* else {
-            continuar_entrenamiento = false;
-         }*/
+        }
     }
 
     let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    //let model = config.init(vb)?;
-    let mut model = config.init(vb)?;
+    let model = config.init(vb)?;
 
     if existe_modelo {
          if !continuar_entrenamiento {
@@ -468,13 +436,15 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
              println!("-----------------------------\n");
         }
 
-        let num_sequences = tokens.len().saturating_sub(seq_length + 1);
-        let num_actual_sequences = num_sequences / stride;
+        let num_sequences = tokens.len().saturating_sub(seq_length);
+        let num_actual_sequences = (num_sequences + stride - 1) / stride;
 
         // Group parameters for optimizers (as in main.rs)
         let parsed_block_types = match config.lstm_type {
             LstmType::SLSTM => vec![BlockType::SLSTM; num_blocks],
             LstmType::MLSTM => vec![BlockType::MLSTM; num_blocks],
+            LstmType::MinGRU => vec![BlockType::MinGRU; num_blocks],
+            LstmType::MinLSTM => vec![BlockType::MinLSTM; num_blocks],
             LstmType::Alternate => (0..num_blocks)
                 .map(|i| if i % 2 == 0 { BlockType::SLSTM } else { BlockType::MLSTM })
                 .collect(),
@@ -483,6 +453,8 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
 
         let mut slstm_params = Vec::new();
         let mut mlstm_params = Vec::new();
+        let mut mingru_params = Vec::new();
+        let mut minlstm_params = Vec::new();
         let mut other_params = Vec::new();
 
         let data = varmap.data().lock().unwrap();
@@ -496,6 +468,8 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
                                  match parsed_block_types[idx] {
                                      BlockType::SLSTM => slstm_params.push(var.clone()),
                                      BlockType::MLSTM => mlstm_params.push(var.clone()),
+                                     BlockType::MinGRU => mingru_params.push(var.clone()),
+                                     BlockType::MinLSTM => minlstm_params.push(var.clone()),
                                  }
                              } else { other_params.push(var.clone()); }
                          } else { other_params.push(var.clone()); }
@@ -507,40 +481,36 @@ println!("DEBUG SALTO: {:?}", prueba_salto);
 
         // Tasas de aprendizaje recomendadas para xLSTM: 
         // sLSTM suele tolerar LRs más altas, mLSTM requiere más cuidado.
-        let mut optim_slstm = AdamW::new(slstm_params, ParamsAdamW { lr: 2e-4, ..Default::default() })?;
-       // let mut optim_mlstm = AdamW::new(mlstm_params, ParamsAdamW { lr: 8e-4, ..Default::default() })?;
+        // MinGRU y MinLSTM necesitan LRs extremadamente bajos por estabilidad numérica
+        let mut optim_slstm = AdamW::new(slstm_params, ParamsAdamW { lr: 8e-3, ..Default::default() })?;
+        let mut optim_mlstm = AdamW::new(mlstm_params, ParamsAdamW { lr: 1e-3, ..Default::default() })?;
+        let mut optim_mingru = AdamW::new(mingru_params, ParamsAdamW { lr: 1e-4, ..Default::default() })?;
+        let mut optim_minlstm = AdamW::new(minlstm_params, ParamsAdamW { lr: 5e-6, ..Default::default() })?;
         let mut optim_other = AdamW::new(other_params, ParamsAdamW { lr: 2e-4, ..Default::default() })?;
 
-
-        
-model.print_architecture();
-        let lr_max = 1e-4;
-        let lr_min = 8e-5;
-        let mut aumentando = false; // Control de dirección
-        let step_factor = 1.0;      // Qué tan rápido cambia
-        let mut current_lr = 4e-5;
-        let mut optim_mlstm = AdamW::new(mlstm_params.clone(), ParamsAdamW { 
-            lr: current_lr, 
-            ..Default::default() 
-        })?;
-
-
         println!("Iniciando entrenamiento...\n");
-
+        model.print_architecture();
         let num_batches = num_actual_sequences.div_ceil(batch_size);
-        dropout = 0.0;
+
         for epoch in 0..num_epochs {
             let mut total_loss = 0.0f32;
             let mut num_losses = 0;
             let mut correct = 0;
             let mut total = 0;
-           let mut current_state = None;
-            for batch_idx in 0..num_batches {
+           // let mut current_state = None;
+            let mut batch_order: Vec<usize> = (0..num_batches).collect();
+            {
+                let mut rng = rand::rng();
+                batch_order.shuffle(&mut rng);
+            }
+
+            for (batch_pos, batch_idx) in batch_order.into_iter().enumerate() {
                 let epoch_start = Instant::now();
                 let current_batch_start_seq = batch_idx * batch_size;
                 let current_batch_size = (batch_size).min(num_actual_sequences - current_batch_start_seq);
 
-                    if current_batch_size == 0 { break; }
+                if current_batch_size == 0 { break; }
+                if current_batch_size < batch_size { break; } // Skip incomplete
 
                 let (input_batch, target_batch) = create_batch(
                     &tokens,
@@ -550,117 +520,62 @@ model.print_architecture();
                     stride,
                     &device,
                 )?;
-                if epoch == 0 && batch_idx == 0 {
-                    let input_ids = input_batch.narrow(0, 0, 1)?.squeeze(0)?.to_vec1::<u32>()?;
-                    let target_ids = target_batch.narrow(0, 0, 1)?.squeeze(0)?.to_vec1::<u32>()?;
-                    let input_usize: Vec<usize> = input_ids.iter().map(|&x| x as usize).collect();
-                    let target_usize: Vec<usize> = target_ids.iter().map(|&x| x as usize).collect();
-                    // Reconstrucción desde tokens (sin decode HF), respetando límites de palabra
-                    let input_tokens: Vec<String> = input_usize
-                        .iter()
-                        .map(|&id| tokenizer.id_to_token(id).unwrap_or("?".to_string()))
-                        .collect();
-                    let target_tokens: Vec<String> = target_usize
-                        .iter()
-                        .map(|&id| tokenizer.id_to_token(id).unwrap_or("?".to_string()))
-                        .collect();
-                    let mut input_text = String::new();
-                    for mut t in input_tokens {
-                        if t.contains('Ċ') { input_text.push('\n'); continue; }
-                        let has_space = t.starts_with('▁') || t.starts_with('Ġ');
-                        if has_space {
-                            input_text.push(' ');
-                            t = t.trim_start_matches('▁').trim_start_matches('Ġ').to_string();
-                        }
-                        t = t.replace("\r\n", "").replace('\r', "");
-                        input_text.push_str(&t);
-                    }
-                    let mut target_text = String::new();
-                    for mut t in target_tokens {
-                        if t.contains('Ċ') { target_text.push('\n'); continue; }
-                        let has_space = t.starts_with('▁') || t.starts_with('Ġ');
-                        if has_space {
-                            target_text.push(' ');
-                            t = t.trim_start_matches('▁').trim_start_matches('Ġ').to_string();
-                        }
-                        t = t.replace("\r\n", "").replace('\r', "");
-                        target_text.push_str(&t);
-                    }
-                    input_text = input_text.replace('\n', " ");
-                    target_text = target_text.replace('\n', " ");
-                    input_text = input_text.split_whitespace().collect::<Vec<_>>().join(" ");
-                    target_text = target_text.split_whitespace().collect::<Vec<_>>().join(" ");
-                    println!("\n[Epoch 1] Batch de entrenamiento (texto limpio):");
-                    println!("  Input Texto:  {}", input_text);
-                    println!("  Target Texto: {}", target_text);
-                }
-/*
-                if batch_idx == 0 {
-                    let (_, warm_state) = model.forward(&input_batch, None)?;
-                    current_state = Some(warm_state.into_iter().map(|s| s.map(|state| state.detach())).collect());
-                }*/
-                {
-                    let (logits, next_state) = model.forward(&input_batch, current_state)?;
-                    let logits_flat = logits.reshape((current_batch_size * seq_length, vocab_size))?;
-                    let target_flat = target_batch.reshape((current_batch_size * seq_length,))?;
-                    let loss = candle_nn::loss::cross_entropy(&logits_flat, &target_flat)?;
-                    total_loss += loss.to_scalar::<f32>()?;
-                    num_losses += 1;
-                    let last_logits = logits.narrow(1, seq_length - 1, 1)?.squeeze(1)?;
-                    let last_targets = target_batch.narrow(1, seq_length - 1, 1)?.squeeze(1)?;
-                    let last_preds = last_logits.argmax(1)?;
-                    let correct_count = last_preds.eq(&last_targets)?.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()? as usize;
-                    correct += correct_count;
-                    total += current_batch_size;
-                    let grads = loss.backward()?;
-                    optim_slstm.step(&grads)?;
-                    optim_mlstm.step(&grads)?;
-                    optim_other.step(&grads)?;
-                    current_state = Some(next_state.into_iter().map(|s| s.map(|t| t.detach())).collect());
-                }
 
-                if batch_idx % 1 == 0 || batch_idx == num_batches - 1 {
+             /*  if batch_idx == 0 {
+                // Hacemos un forward silencioso para llenar las matrices del mLSTM
+                let (_, warm_state) = model.forward(&input_batch, None)?;
+                current_state = Some(warm_state.into_iter().map(|s| s.map(|state| state.detach())).collect());
+                println!("> Estado inicializado con éxito en el Batch 0");
+            }*/
+
+                let (logits, _) = model.forward(&input_batch, None)?;
+              //  let (logits, next_state) = model.forward(&input_batch, current_state)?;
+             //   current_state = Some(next_state.into_iter().map(|s| s.map(|state| state.detach())).collect());
+                //current_state = Some(next_state);
+
+
+                // Optimization
+                let logits_flat = logits.reshape((current_batch_size * seq_length, vocab_size))?;
+                let target_flat = target_batch.reshape((current_batch_size * seq_length,))?; // IDs [N]
+
+                // Cross Entropy
+                // Candle cross_entropy expects logits and targets (u32 indices)
+                let loss = candle_nn::loss::cross_entropy(&logits_flat, &target_flat)?;
+                let batch_loss = loss.to_scalar::<f32>()?;
+
+                total_loss += batch_loss;
+                num_losses += 1;
+
+                // Accuracy
+                let preds = logits_flat.argmax(1)?;
+                let correct_count = preds.eq(&target_flat)?.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()? as usize;
+                correct += correct_count;
+                total += current_batch_size * seq_length;
+
+                let grads = loss.backward()?;
+
+                /* 
+                // --- GRADIENT CLIPPING (Desactivado temporalmente) ---
+                // Para xLSTM es vital clipear gradientes debido a las funciones exponenciales
+                // Nota: La API de GradStore en Candle no tiene los métodos esperados
+                // Por ahora nos basamos en LR bajo y clamping para estabilidad
+                */
+
+                // Ahora los optimizadores usarán los gradientes
+                optim_slstm.step(&grads)?;
+                optim_mlstm.step(&grads)?;
+                optim_mingru.step(&grads)?;
+                optim_minlstm.step(&grads)?;
+                optim_other.step(&grads)?;
+
+                if batch_pos % 1 == 0 || batch_pos == num_batches - 1 {
                     let elapsed = epoch_start.elapsed().as_secs_f32();
-                    print!("\r  -> Batch [{}/{}] Loss: {:.4} Acc: {:.2}% ({:.1}s)", 
-                        batch_idx + 1, num_batches, total_loss / (num_losses as f32),
+                    print!("\r  -> Batch [{}/{}] Loss: {:.4} (avg {:.4}) Acc: {:.2}% ({:.1}s)", 
+                        batch_pos + 1, num_batches, batch_loss, total_loss / (num_losses as f32),
                         100.0 * correct as f32 / total as f32, elapsed);
                     io::stdout().flush().unwrap();
-                
+               
                 }
-            
-                 if batch_idx % 50 == 0 && batch_idx > 0 {
-                    let factor = step_factor as f32; //  errores
-
-                    if aumentando {
-
-                        dropout /= factor;           // 1. Actualizamos la variable local
-                        model.dropout = dropout;     // 2. Se la pasamos al model
-                        current_lr /= step_factor; // El LR suele ser f64, está bien
-                        if current_lr >= lr_max {
-                            current_lr = lr_max;
-                            aumentando = false; 
-                        }
-                    } else {
-                            dropout *= factor;           // 1. Actualizamos la variable local 
-                        current_lr *= step_factor; 
-                        if current_lr <= lr_min {
-                            current_lr = lr_min;
-                            aumentando = true; 
-                        }
-                    }
-                    dropout = 0.0;//dropout.clamp(-0.0, 0.0);
-                    model.blocks.iter_mut().for_each(|b| b.dropout_prob = dropout);
-            
-                    println!(
-                        "\n[CYCLIC SCHEDULER] LR: {:.2e} | Dropout: {:.4} | Dirección: {}", 
-                        current_lr, 
-                       dropout, //
-                        if aumentando { "Sube ↑" } else { "Baja ↓" }
-                    );
-                } 
-
-                optim_mlstm = AdamW::new(mlstm_params.clone(),ParamsAdamW {lr: current_lr,..Default::default() }  )?;
-                                        
             }
             println!();
 
@@ -675,24 +590,16 @@ model.print_architecture();
             // Generate sample
              if epoch % 1 == 0 {
                 let mut rng = rand::rng();
-                let mut start = if tokens.len() > 40 {
-                    rng.random_range(0..tokens.len() - 40)
+                let start_random = if tokens.len() > 10 {
+                    rng.random_range(0..tokens.len() - 6)
                 } else { 0 };
-                for _ in 0..20 {
-                    if start >= tokens.len() { break; }
-                    let tok = tokenizer.id_to_token(tokens[start]).unwrap_or_default();
-                    if tok.starts_with('▁') || tok.starts_with('Ġ') || tok.contains('Ċ') { break; }
-                    start += 1;
-                }
-                let take = 30.min(tokens.len().saturating_sub(start));
-                let seed_slice: &[usize] = &tokens[start..start + take];
-                let mut seed_clean = tokenizer.decode(seed_slice);
-                seed_clean = seed_clean.replace('▁', " ").replace('Ġ', " ").replace("Ċ", "\n").replace("\r\n", "\n");
-                seed_clean = seed_clean.split_whitespace().collect::<Vec<_>>().join(" ");
-                println!("  -> Generando con semilla al azar: '{}'", seed_clean);
-                let generated = generate_text(&model, &tokenizer, &seed_clean, 100, &device)?;
-                let generated_clean = generated.replace('▁', " ").replace('Ġ', " ").replace("\r\n", "\n");
-                println!("  Generado: {}\n", generated_clean);
+                
+                let seed_tokens: Vec<usize> = tokens[start_random..start_random + 5].to_vec();
+                let seed = tokenizer.decode(&seed_tokens);
+                
+                println!("  -> Generando con semilla al azar: '{}'", seed);
+                let generated = generate_text(&model, &tokenizer, &seed, 100, &device)?;
+                println!("  Generado: {}\n", generated);
             }
         }
         println!("\n¡Entrenamiento completado!");

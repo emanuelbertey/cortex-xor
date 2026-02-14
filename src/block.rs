@@ -12,7 +12,16 @@ use candle_core::{Tensor, Result};
 use candle_nn::{Dropout, Module, VarBuilder, LayerNorm, Linear, layer_norm, linear};
 use serde::{Deserialize, Serialize};
 
-use crate::{MLstm, MLstmconfig, MLstmstate, SLstm, SLstmconfig, SLstmstate, MinGru, MinGruConfig, MinLstm, MinLstmConfig};
+pub mod mlstm;
+pub mod slstm;
+pub mod min_gru;
+pub mod min_lstm;
+pub mod min_lstm_threaded;
+
+use self::mlstm::{MLstm, MLstmconfig, MLstmstate};
+use self::slstm::{SLstm, SLstmconfig, SLstmstate};
+use self::min_gru::{MinGru, MinGruConfig};
+use self::min_lstm::{MinLstm, MinLstmConfig};
 
 /// Type of LSTM block
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,7 +185,7 @@ impl XLstmblock {
 
         // 2. DROPOUT INICIAL: Solo si es necesario sobre el input normalizado
         let x = if self.dropout_prob > 0.0 {
-            candle_nn::ops::dropout(&x, self.dropout_prob)?
+            self.dropout.forward(&x, true)?
         } else {
             x
         };
@@ -214,11 +223,8 @@ impl XLstmblock {
         // 4. PROYECCIÓN Y DROPOUT DE SALIDA
         let output = self.proj.forward(&lstm_output)?;
         
-        // 5. RESIDUAL CONNECTION (Pre-Norm Style)
-        // Sumamos el resultado a 'input_seq' original (el que no fue normalizado)
-        // Esto crea el "highway" de gradientes limpio.
-       let output = (output + input_seq )?;
-         // let output = ((output * 0.8)? + input_seq )?;
+        // 5. RESIDUAL CONNECTION (Pre-Norm Style) con ligera atenuación
+        let output = (output.affine(0.8, 0.0)? + input_seq)?;
 
         Ok((output, new_state))
     }

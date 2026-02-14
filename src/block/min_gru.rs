@@ -117,13 +117,11 @@ impl MinGru {
     /// Heinsen associative scan in log space (appendix B)
     fn heinsen_associative_scan_log(&self, log_coeffs: &Tensor, log_values: &Tensor) -> Result<Tensor> {
         let a_star = log_coeffs.cumsum(1)?;
-        let a_star_max = a_star.max_keepdim(1)?;
-        let a_star_stable = a_star.broadcast_sub(&a_star_max)?;
-        let log_u = log_values.sub(&a_star.broadcast_as(log_values.shape())?)?;
-        let u = log_u.clamp(-15.0, 15.0)?.exp()?;
-        let s = u.cumsum(1)?;
-        let out = a_star_stable.exp()?.mul(&s)?;
-        out.broadcast_mul(&a_star_max.exp()?)
+        let log_ratio = log_values.sub(&a_star.broadcast_as(log_values.shape())?)?;
+        let ratio_max = log_ratio.max_keepdim(1)?;
+        let s = log_ratio.broadcast_sub(&ratio_max)?.exp()?.cumsum(1)?;
+        let out_log = s.log()?.broadcast_add(&a_star)?.broadcast_add(&ratio_max)?;
+        out_log.exp()
     }
 
     /// Forward pass for MinGRU

@@ -1,4 +1,4 @@
-use candle_core::{Tensor, Result};
+use candle_core::{Tensor, Result, DType};
 use candle_nn::{Module, VarBuilder, Linear};
 use candle_nn::init::Init;
 use serde::{Deserialize, Serialize};
@@ -23,11 +23,11 @@ impl MinLstmConfig {
             expansion_factor: 1.0, 
             heads: 1,
             // Valores por defecto sugeridos
-            weight_stdev: 0.02,
-            forget_bias: 6.2,
+            weight_stdev: 0.03,
+            forget_bias: 2.2,
             epsilon: 1e-6,
             log_clamp: 1e-4,
-            scan_clamp: 5.5,
+            scan_clamp: 12.0,
         }
     }
 
@@ -84,10 +84,10 @@ impl MinLstm {
         let dtype = x.dtype();
 
         let hfg = self.to_hfg.forward(x)?.broadcast_add(&self.bias_offset)?; 
-        
-        let scale = (self.dim_inner as f64).sqrt();
-        let hfg_scaled = (&hfg / scale)?;
-
+        // Escalado 1/sqrt(d) como en el paper
+        let inv_sqrt = 1.0f64 / (self.dim_inner as f64).sqrt();
+        let hfg_scaled = hfg.affine(inv_sqrt, 0.0)?;
+        // Gates del paper: g con tanh, f e i con sigmoide
         let g = hfg_scaled.narrow(2, 0, self.dim_inner)?.tanh()?;
         let f = candle_nn::ops::sigmoid(&hfg_scaled.narrow(2, self.dim_inner, self.dim_inner)?)?;
         let i = candle_nn::ops::sigmoid(&hfg_scaled.narrow(2, 2 * self.dim_inner, self.dim_inner)?)?;
@@ -97,27 +97,24 @@ impl MinLstm {
         let f_hat = f.div(&den)?;
         let i_hat = i.div(&den)?;
 
-        let log_f = f_hat.clamp(self.config.log_clamp, 1.0 - self.config.log_clamp)?.log()?;
-        
-        let h0 = match prev_h {
-            Some(h) => h.reshape((b, 1, self.dim_inner))?,
-            None => Tensor::zeros((b, 1, self.dim_inner), dtype, dev)?,
-        };
-
-        let input_combined = Tensor::cat(&[&h0, &i_hat.mul(&g)?], 1)?;
-        let log_f_combined = Tensor::cat(&[
-            &Tensor::zeros((b, 1, self.dim_inner), dtype, dev)?, 
-            &log_f
-        ], 1)?;
-
-        let log_f_cumsum = log_f_combined.cumsum(1)?;
-        
-        let s_clamp = self.config.scan_clamp as f64;
-        let decay = log_f_cumsum.clamp(-s_clamp, s_clamp)?.exp()?;
-        let inv_decay = log_f_cumsum.neg()?.clamp(-s_clamp, s_clamp)?.exp()?;
-        
-        let h_t_full = input_combined.mul(&inv_decay)?.cumsum(1)?.mul(&decay)?;
-        let h_t = h_t_full.narrow(1, 1, seq)?.contiguous()?;
+        // Scan simple del paper: a_t = exp(cumsum(log f_hat)), b_t = (i*g)/a_t, h_t = cumsum(b_t) * a_t
+        let log_f = f_hat.log()?;
+        let a_star = log_f.cumsum(1)?;
+        let a_t_f64 = a_star.to_dtype(DType::F64)?.exp()?;
+        let ig_f64 = i_hat.mul(&g)?.to_dtype(DType::F64)?;
+        let b_t_f64 = ig_f64.div(&a_t_f64)?;
+        let h_t_parallel_f64 = b_t_f64.cumsum(1)?.mul(&a_t_f64)?;
+        let h_t_parallel = h_t_parallel_f64.to_dtype(dtype)?;
+        let h_t = if let Some(h0) = prev_h {
+            let h0_decayed = h0
+                .reshape((b, 1, self.dim_inner))?
+                .to_dtype(DType::F64)?
+                .mul(&a_t_f64)?
+                .to_dtype(dtype)?;
+            h_t_parallel.add(&h0_decayed)?
+        } else {
+            h_t_parallel
+        }.contiguous()?;
 
         let next_h = if return_next {
             Some(h_t.narrow(1, seq - 1, 1)?.contiguous()?)

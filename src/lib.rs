@@ -46,21 +46,14 @@ let lr_config = LearningRateConfig::per_block_type(
 extern crate alloc;
 
 mod block;
-mod gate_controller;
-mod mlstm;
 mod model;
-mod slstm;
-mod min_gru;
-mod min_lstm;
-mod min_lstm_threaded;
 
 pub use block::{BlockType, XLstmblock, XLstmblockConfig, LSTMState};
-pub use gate_controller::GateController;
-pub use mlstm::{MLstm, MLstmcell, MLstmconfig, MLstmstate};
+pub use block::mlstm::{MLstm, MLstmcell, MLstmconfig, MLstmstate};
 pub use model::{LstmType, XLstm, XLstmconfig};
-pub use slstm::{SLstm, SLstmcell, SLstmconfig, SLstmstate};
-pub use min_gru::{MinGru, MinGruConfig};
-pub use min_lstm::{MinLstm, MinLstmConfig};
-pub use min_lstm_threaded::MinLstmThreaded;
+pub use block::slstm::{SLstm, SLstmcell, SLstmconfig, SLstmstate};
+pub use block::min_gru::{MinGru, MinGruConfig};
+pub use block::min_lstm::{MinLstm, MinLstmConfig};
+pub use block::min_lstm_threaded::MinLstmThreaded;
 
 pub const VERSION: &str = "0.1.0";

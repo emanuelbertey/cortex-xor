@@ -29,36 +29,94 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "multi"
-path = "src/multi.rs"
+path = "src/model/multi.rs"
 
 [[bin]]
 name = "mlstmchat"
-path = "src/msltmchat.rs"
+path = "src/model/msltmchat.rs"
 
 [[bin]]
 name = "mlstmnew"
-path = "src/mlstmnew.rs"
+path = "src/model/mlstmnew.rs"
 
 [[bin]]
 name = "slstmchat"
-path = "src/slstmchat.rs"
+path = "src/model/slstmchat.rs"
 
 [[bin]]
 name = "2slstmchat"
-path = "src/slstmchat2.rs"
+path = "src/model/slstmchat2.rs"
 
 [[bin]]
 name = "cortexslstm"
-path = "src/cortexslstm.rs"
+path = "src/model/cortexslstm.rs"
 
 [[bin]]
 name = "cortexthread"
-path = "src/cortexthread.rs"
+path = "src/model/cortexthread.rs"
 
 
 [[bin]]
 name = "xlstmchat"
-path = "src/xlstmchat.rs"
+path = "src/model/xlstmchat.rs"
+
+[[bin]]
+name = "tinystory"
+path = "src/model/tinystory.rs"
+
+[[bin]]
+name = "tinystory2v"
+path = "src/model/tinystory2v.rs"
+
+[[bin]]
+name = "tinystory3v"
+path = "src/model/tinystory3v.rs"
+
+[[bin]]
+name = "mlstm_minlstm_chat"
+path = "src/model/mlstm_minlstm_chat.rs"
+
+# Tests
+
+[[bin]]
+name = "test_mingru_stability"
+path = "src/tests/test_mingru_stability.rs"
+
+[[bin]]
+name = "test_slstm_mlstm_stability"
+path = "src/tests/test_slstm_mlstm_stability.rs"
+
+[[bin]]
+name = "test_minlstm_param_sweep"
+path = "src/tests/test_minlstm_param_sweep.rs"
+
+[[bin]]
+name = "test_minlstm_threaded"
+path = "src/tests/test_minlstm_threaded.rs"
+
+[[bin]]
+name = "test_mlstm_param_sweep"
+path = "src/tests/test_mlstm_param_sweep.rs"
+
+[[bin]]
+name = "test_mlstm_plus"
+path = "src/tests/test_mlstm_plus.rs"
+
+[[bin]]
+name = "test_slstm_param_sweep"
+path = "src/tests/test_slstm_param_sweep.rs"
+
+[[bin]]
+name = "bug-luong"
+path = "src/tests/bug-luong.rs"
+
+[[bin]]
+name = "min_vs_lstm"
+path = "src/tests/min_vs_lstm.rs"
+
+[[bin]]
+name = "test_min_threaded"
+path = "src/tests/test_min_threaded.rs"
 
 [profile.release]
 #opt-level = 3
