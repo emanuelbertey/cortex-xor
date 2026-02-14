@@ -21,6 +21,32 @@ We are actively implementing and testing the following blocks, often in stacked 
 *   **Datasets:** The models are primarily trained and benchmarked on **Shakespeare** and **TinyStories V2** datasets.
 *   **Process:** The project is in a state of constant flux, with ongoing stability tests, parameter sweeps, and continuous code improvements.
 
+## Performance Demo: xLSTM vs minLSTM
+A comparison demonstrating the trade-off between "Brain" (accuracy) and "Time" (efficiency):
+
+*   **xLSTM** (More "Brain"):
+    *   **Accuracy:** ~22
+    *   **Time (100 tokens):** 0.70s
+    *   **Note:** Higher resource consumption.
+    *   **Sample:**
+        > king,
+        > And told your honour, my lord, I know not
+        > com, and you to me by my gracious lord.
+        > DUKE VINCENTIO:
+        > Ah, and the wounds for this modnerousous and strong to my heart,
+
+*   **minLSTM** (More Speed):
+    *   **Accuracy:** ~19
+    *   **Time (100 tokens):** 0.20s
+    *   **Efficiency:** Consumes ~50% less RAM than xLSTM.
+    *   **Sample:**
+        > king, as the sigh bedildier
+        > Stucucess, towningman:
+        > Wealmpove
+        > For:
+        > Thybed to the master's death.
+
+
 ---
 
 # Cortex-XOR: Sala de Pruebas Experimental de RNNs
@@ -43,3 +69,28 @@ Estamos implementando y probando activamente los siguientes bloques, a menudo en
 ## Entrenamiento y Metodología
 *   **Datasets:** Los modelos se entrenan y evalúan principalmente con los datasets de **Shakespeare** y **TinyStories V2**.
 *   **Proceso:** El proyecto está en un estado de cambio constante, con pruebas de estabilidad en curso, barridos de parámetros y mejoras continuas en el código.
+
+## Demostración de Rendimiento: xLSTM vs minLSTM
+Una comparación que demuestra el compromiso entre "Cerebro" (precisión) y "Tiempo" (eficiencia):
+
+*   **xLSTM** (Más "Cerebro"):
+    *   **Precisión:** ~22
+    *   **Tiempo (100 tokens):** 0.70s
+    *   **Nota:** Mayor consumo de recursos.
+    *   **Muestra:**
+        > king,
+        > And told your honour, my lord, I know not
+        > com, and you to me by my gracious lord.
+        > DUKE VINCENTIO:
+        > Ah, and the wounds for this modnerousous and strong to my heart,
+
+*   **minLSTM** (Más Velocidad):
+    *   **Precisión:** ~19
+    *   **Tiempo (100 tokens):** 0.20s
+    *   **Eficiencia:** Consume ~50% menos RAM que xLSTM.
+    *   **Muestra:**
+        > king, as the sigh bedildier
+        > Stucucess, towningman:
+        > Wealmpove
+        > For:
+        > Thybed to the master's death.

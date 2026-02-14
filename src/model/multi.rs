@@ -352,16 +352,26 @@ fn main() -> Result<()> {
         }
         drop(data);
 
-        let mut optim_slstm = AdamW::new(slstm_params, ParamsAdamW { lr: 4e-3, ..Default::default() })?;
-        let mut optim_mlstm = AdamW::new(mlstm_params, ParamsAdamW { lr: 1e-3, ..Default::default() })?; // Subido de 3e-4
+      //  let mut optim_slstm = AdamW::new(slstm_params, ParamsAdamW { lr: 4e-3, ..Default::default() })?;
+       let mut optim_slstm  = AdamW::new( slstm_params,ParamsAdamW {lr: 3e-3,
+        weight_decay: 0.01, beta1: 0.9,   beta2: 0.999,eps: 1e-8,},)?;
+      
+       // let mut optim_mlstm = AdamW::new(mlstm_params, ParamsAdamW { lr: 1e-3, ..Default::default() })?; // Subido de 3e-4
+      let mut optim_mlstm = AdamW::new( mlstm_params,ParamsAdamW {lr: 8e-4,
+        weight_decay: 0.01, beta1: 0.9,   beta2: 0.999,eps: 1e-8,},)?;
+     
         let mut optim_mingru = AdamW::new(mingru_params, ParamsAdamW { lr: 1e-3, ..Default::default() })?; // Subido de 6e-4
-        let mut optim_minlstm = AdamW::new(minlstm_params, ParamsAdamW { lr: 1e-3, ..Default::default() })?; // Subido de 3e-4
+      //  let mut optim_minlstm = AdamW::new(minlstm_params, ParamsAdamW { lr: 1e-3, ..Default::default() })?; // Subido de 3e-4
+         let mut optim_minlstm = AdamW::new( minlstm_params,ParamsAdamW {lr: 9e-4,
+        weight_decay: 0.01, beta1: 0.9,   beta2: 0.999,eps: 1e-8,},)?;
+      
         let mut optim_other = AdamW::new( other_params,ParamsAdamW {lr: 1e-3,
         weight_decay: 0.01, beta1: 0.9,   beta2: 0.999,eps: 1e-8,},)?;
-        
+
         println!("Iniciando entrenamiento...\n");
         model.print_architecture();
         let num_batches = num_actual_sequences.div_ceil(batch_size);
+        let mut prev_accuracy = 0.0;
 
         for epoch in 0..num_epochs {
             let mut total_loss = 0.0f32;
@@ -430,6 +440,18 @@ fn main() -> Result<()> {
 
             println!("Epoch [{:3}/{}], Loss: {:.4}, Accuracy: {:.2}%", epoch + 1, num_epochs, avg_loss, accuracy);
 
+            if epoch > 0 && accuracy < prev_accuracy + 1.0 {
+                println!("  -> Accuracy no mejoró 1% (prev: {:.2}%), bajando LR x0.9", prev_accuracy);
+                let decay = 0.9;
+                optim_slstm.set_learning_rate(optim_slstm.learning_rate() * decay);
+                optim_mlstm.set_learning_rate(optim_mlstm.learning_rate() * decay);
+                optim_mingru.set_learning_rate(optim_mingru.learning_rate() * decay);
+                optim_minlstm.set_learning_rate(optim_minlstm.learning_rate() * decay);
+                optim_other.set_learning_rate(optim_other.learning_rate() * decay);
+                println!("     Nuevo LR sLSTM: {:.2e}", optim_slstm.learning_rate());
+            }
+            prev_accuracy = accuracy;
+
             varmap.save(model_path)?;
 
             if epoch % 1 == 0 {
@@ -442,8 +464,11 @@ fn main() -> Result<()> {
                 let seed = tokenizer.decode(&seed_tokens);
                 
                 println!("  -> Generando con semilla al azar: '{}'", seed);
+                let start_gen = Instant::now();
                 let generated = generate_text(&model, &tokenizer, &seed, 100, &device)?;
+                let elapsed = start_gen.elapsed().as_secs_f32();
                 println!("  Generado: {}\n", generated);
+                println!("  Tiempo: {:.2}s\n", elapsed);
             }
         }
         println!("\n¡Entrenamiento completado!");
@@ -489,8 +514,11 @@ fn main() -> Result<()> {
         };
 
         println!("\nGenerando...");
+        let start_gen = Instant::now();
         let generated = generate_text(&model, &tokenizer, &seed, gen_length, &device)?;
+        let elapsed = start_gen.elapsed().as_secs_f32();
         println!("Generado: {}\n", generated);
+        println!("Tiempo: {:.2}s\n", elapsed);
     }
 
     Ok(())
